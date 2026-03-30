@@ -1,5 +1,6 @@
-import { useState, useEffect, useCallback, type CSSProperties, type FormEvent } from "react";
+import { useState, useEffect, useCallback, useRef, type CSSProperties, type FormEvent } from "react";
 import { usePersistedState } from "./hooks/usePersistedState";
+import Anthropic from "@anthropic-ai/sdk";
 
 const DAYS = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi", "Dimanche"];
 const SHORT_DAYS = ["LUN", "MAR", "MER", "JEU", "VEN", "SAM", "DIM"];
@@ -33,6 +34,67 @@ function smoothBezierPath(points: Array<{ x: number; y: number }>): string {
     d += ` C ${cpX},${prev.y} ${cpX},${curr.y} ${curr.x},${curr.y}`;
   }
   return d;
+}
+
+function parseRestSeconds(rest: string): number {
+  if (/^\d+s$/.test(rest)) return parseInt(rest);
+  const m = rest.match(/^(\d+)min(\d+)?/);
+  if (m) return parseInt(m[1]) * 60 + (m[2] ? parseInt(m[2]) : 0);
+  return 120;
+}
+
+function playBeep() {
+  try {
+    const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.frequency.value = 880;
+    gain.gain.setValueAtTime(0.4, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 1.2);
+    osc.start();
+    osc.stop(ctx.currentTime + 1.2);
+  } catch {}
+}
+
+function getNextMonday(): string {
+  const d = new Date();
+  const day = d.getDay();
+  const diff = day === 0 ? 1 : day === 6 ? 2 : 8 - day;
+  d.setDate(d.getDate() + diff);
+  return d.toISOString().slice(0, 10);
+}
+
+function computeWeeklyGain(weights: WeightEntry[]): number | null {
+  if (weights.length < 2) return null;
+  const sorted = [...weights].sort((a, b) => a.date.localeCompare(b.date));
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - 28);
+  const recent = sorted.filter(w => new Date(w.date) >= cutoff);
+  const data = recent.length >= 2 ? recent : sorted;
+  const days = (new Date(data[data.length - 1].date).getTime() - new Date(data[0].date).getTime()) / 86400000;
+  if (days < 1) return null;
+  return (data[data.length - 1].kg - data[0].kg) / (days / 7);
+}
+
+function computeTarget(weeklyGain: number | null, currentKg: number | null): { kcal: number; protein: number; reason: string } {
+  const kg = currentKg ?? 60;
+  const BASE = 2400;
+  const PROT = Math.round(kg * 3);
+  if (weeklyGain === null) return { kcal: BASE, protein: PROT, reason: "Données insuffisantes — objectifs de base" };
+  if (weeklyGain < 0)     return { kcal: BASE + 300, protein: PROT + 20, reason: `Perte de ${Math.abs(weeklyGain).toFixed(2)} kg/sem → +300 kcal pour inverser` };
+  if (weeklyGain < 0.2)   return { kcal: BASE + 200, protein: PROT + 15, reason: `+${weeklyGain.toFixed(2)} kg/sem insuffisant → +200 kcal` };
+  if (weeklyGain < 0.35)  return { kcal: BASE + 100, protein: PROT + 10, reason: `+${weeklyGain.toFixed(2)} kg/sem légèrement faible → +100 kcal` };
+  if (weeklyGain <= 0.55) return { kcal: BASE,       protein: PROT,      reason: `+${weeklyGain.toFixed(2)} kg/sem ✓ progression idéale` };
+  if (weeklyGain <= 0.75) return { kcal: BASE - 100, protein: PROT,      reason: `+${weeklyGain.toFixed(2)} kg/sem élevée → -100 kcal` };
+                          return { kcal: BASE - 200, protein: PROT,      reason: `+${weeklyGain.toFixed(2)} kg/sem trop rapide → -200 kcal` };
+}
+
+function formatTimer(secs: number): string {
+  const m = Math.floor(secs / 60);
+  const s = secs % 60;
+  return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
 // --- DATA ---
@@ -258,6 +320,32 @@ function useGroceryDone() {
 const WEIGHT_STORAGE_KEY = "muscu-weight-data";
 
 type WeightEntry = { date: string; kg: number };
+type SetLog = { kg: number; reps: number };
+type ExoLog = { date: string; muscle: string; exercise: string; sets: SetLog[] };
+type MealEntry = { name: string; detail: string; kcal: number; p: number; g: number; l: number };
+type GeneratedPlanDay = {
+  petitDej: MealEntry; collationAM: MealEntry; dejeuner: MealEntry; gouter: MealEntry; diner: MealEntry;
+  total: { kcal: number; p: number; g: number; l: number };
+};
+type GeneratedPlan = {
+  weekStart: string; generatedAt: string; calorieTarget: number; proteinTarget: number;
+  adjustment: string; days: Record<string, GeneratedPlanDay>;
+};
+
+type FoodResult = {
+  product_name: string;
+  brands: string;
+  nutriscore_grade?: string;
+  nutriments: {
+    "energy-kcal_100g": number;
+    proteins_100g: number;
+    carbohydrates_100g: number;
+    fat_100g: number;
+    sugars_100g?: number;
+    fiber_100g?: number;
+    salt_100g?: number;
+  };
+};
 
 const useWeightData = () => {
   const [weights, setWeights] = useState<WeightEntry[]>([]);
@@ -419,15 +507,55 @@ export default function App() {
   const [newKg, setNewKg] = useState("");
   const [weightFormError, setWeightFormError] = useState<string | null>(null);
 
+  // Timer
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [timerLeft, setTimerLeft] = useState(0);
+  const [timerTotal, setTimerTotal] = useState(0);
+  const [timerLabel, setTimerLabel] = useState("");
+
+  // Workout log
+  const [workoutLog, setWorkoutLog] = usePersistedState<ExoLog[]>("muscu-workout-log", []);
+  const [pendingExoSets, setPendingExoSets] = useState<SetLog[]>([]);
+  const [logKg, setLogKg] = useState("");
+  const [logReps, setLogReps] = useState("");
+
+  // Food search
+  const [foodQuery, setFoodQuery] = useState("");
+  const [foodResults, setFoodResults] = useState<FoodResult[]>([]);
+  const [foodLoading, setFoodLoading] = useState(false);
+  const [foodSearched, setFoodSearched] = useState(false);
+  const [expandedFood, setExpandedFood] = useState<number | null>(null);
+  const [portionGrams, setPortionGrams] = useState("100");
+  const [foodFavorites, setFoodFavorites] = usePersistedState<FoodResult[]>("muscu-food-favorites", []);
+  const [recentSearches, setRecentSearches] = usePersistedState<string[]>("muscu-food-recent", []);
+
+  // Weekly AI plan
+  const [apiKey, setApiKey] = usePersistedState<string>("muscu-api-key", "");
+  const [apiKeyInput, setApiKeyInput] = useState("");
+  const [generatedPlans, setGeneratedPlans] = usePersistedState<GeneratedPlan[]>("muscu-weekly-plans", []);
+  const [planGenerating, setPlanGenerating] = useState(false);
+  const [planError, setPlanError] = useState<string | null>(null);
+  const [expandedPlanDay, setExpandedPlanDay] = useState<string | null>(null);
+  const autoGenDoneRef = useRef(false);
+
+  // Edit saved set
+  const [editingSet, setEditingSet] = useState<{ exercise: string; date: string; idx: number } | null>(null);
+  const [editSetKg, setEditSetKg] = useState("");
+  const [editSetReps, setEditSetReps] = useState("");
+
   const latestWeight = weights.length > 0 ? weights[weights.length - 1] : null;
   const groceryChecked = GROCERIES.filter((g) => groceryDone[g.item]).length;
+  const imc = latestWeight ? latestWeight.kg / (1.8 * 1.8) : null;
+  const todayStr = new Date().toISOString().slice(0, 10);
 
   const tabs = [
     { id: "planning", label: "Planning", icon: "📅" },
+    { id: "hebdo", label: "Hebdo", icon: "🔄" },
     { id: "nutrition", label: "Nutrition", icon: "🥗" },
     { id: "training", label: "Muscu", icon: "🏋️" },
     { id: "mealprep", label: "Prep", icon: "🍳" },
     { id: "suivi", label: "Suivi", icon: "📈" },
+    { id: "aliments", label: "Aliments", icon: "🔍" },
   ];
 
   const daySchedule = WEEKLY_SCHEDULE[selectedDay as keyof typeof WEEKLY_SCHEDULE];
@@ -448,6 +576,234 @@ export default function App() {
     if (kgNum < 35 || kgNum > 220) { setWeightFormError("Poids hors plage (35–220 kg)."); return; }
     addWeight(newDate, String(kgNum));
     setNewKg("");
+  };
+
+  const weeklyGain = computeWeeklyGain(weights);
+  const targetData = computeTarget(weeklyGain, latestWeight?.kg ?? null);
+
+  const generateWeeklyPlan = async (weekStart?: string) => {
+    if (!apiKey) return;
+    const wStart = weekStart ?? getNextMonday();
+    setPlanGenerating(true);
+    setPlanError(null);
+    setExpandedPlanDay(null);
+
+    const weightHistory = [...weights].sort((a, b) => a.date.localeCompare(b.date))
+      .slice(-16).map(w => `${w.date}: ${w.kg}kg`).join(", ") || "Aucune pesée enregistrée";
+    const totalGain = weights.length >= 2
+      ? `+${(weights[weights.length - 1].kg - weights[0].kg).toFixed(1)}kg depuis le début`
+      : "départ non enregistré";
+
+    const prompt = `Tu es un expert en nutrition sportive pour la prise de masse.
+
+Profil athlète: Ectomorphe, ${latestWeight?.kg ?? 60}kg, 1.80m, objectif prise de masse propre
+Semaine à planifier: du ${wStart}
+Historique poids: ${weightHistory}
+Bilan: ${totalGain}
+Évolution récente: ${weeklyGain !== null ? `${weeklyGain > 0 ? "+" : ""}${weeklyGain.toFixed(2)} kg/semaine` : "données insuffisantes"}
+Cible cette semaine: ${targetData.kcal} kcal/jour · ${targetData.protein}g protéines/jour
+Raison: ${targetData.reason}
+
+Génère un plan repas complet pour 7 jours (Lundi à Dimanche).
+Contraintes: aliments simples et économiques uniquement (poulet, riz, pâtes, œufs, thon, saumon, steak haché 5%, skyr, flocons d'avoine, légumes, fruits).
+Varie les protéines d'un jour à l'autre. Adapte les portions pour atteindre la cible calorique.
+
+Retourne UNIQUEMENT un JSON valide sans texte autour:
+{
+  "adjustment": "${targetData.reason}",
+  "calorieTarget": ${targetData.kcal},
+  "proteinTarget": ${targetData.protein},
+  "Lundi": {
+    "petitDej": {"name":"Porridge protéiné","detail":"80g flocons + 300ml lait + 200g skyr + 1 banane","kcal":650,"p":45,"g":95,"l":15},
+    "collationAM": {"name":"...","detail":"...","kcal":230,"p":18,"g":38,"l":2},
+    "dejeuner": {"name":"...","detail":"...","kcal":650,"p":55,"g":80,"l":8},
+    "gouter": {"name":"...","detail":"...","kcal":310,"p":20,"g":22,"l":16},
+    "diner": {"name":"...","detail":"...","kcal":560,"p":48,"g":65,"l":10},
+    "total": {"kcal":${targetData.kcal},"p":${targetData.protein},"g":300,"l":51}
+  },
+  "Mardi": {...},
+  "Mercredi": {...},
+  "Jeudi": {...},
+  "Vendredi": {...},
+  "Samedi": {...},
+  "Dimanche": {...}
+}`;
+
+    try {
+      const client = new Anthropic({ apiKey, dangerouslyAllowBrowser: true });
+      const msg = await client.messages.create({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 4096,
+        messages: [{ role: "user", content: prompt }],
+      });
+      const text = msg.content[0].type === "text" ? msg.content[0].text : "";
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) throw new Error("Réponse invalide du modèle");
+      const parsed = JSON.parse(jsonMatch[0]);
+      const plan: GeneratedPlan = {
+        weekStart: wStart,
+        generatedAt: new Date().toISOString(),
+        calorieTarget: parsed.calorieTarget ?? targetData.kcal,
+        proteinTarget: parsed.proteinTarget ?? targetData.protein,
+        adjustment: parsed.adjustment ?? targetData.reason,
+        days: { Lundi: parsed.Lundi, Mardi: parsed.Mardi, Mercredi: parsed.Mercredi, Jeudi: parsed.Jeudi, Vendredi: parsed.Vendredi, Samedi: parsed.Samedi, Dimanche: parsed.Dimanche },
+      };
+      setGeneratedPlans(prev => [plan, ...prev.filter(p => p.weekStart !== wStart)].slice(0, 12));
+    } catch (e: any) {
+      setPlanError(e?.message ?? "Erreur inconnue");
+    }
+    setPlanGenerating(false);
+  };
+
+  // Auto-generate every Saturday for the coming week
+  useEffect(() => {
+    if (autoGenDoneRef.current || !apiKey) return;
+    const today = new Date();
+    if (today.getDay() !== 6) return; // Saturday only
+    const nextMon = getNextMonday();
+    if (generatedPlans.some(p => p.weekStart === nextMon)) return;
+    autoGenDoneRef.current = true;
+    generateWeeklyPlan(nextMon);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [apiKey, weights.length]);
+
+  const startTimer = (secs: number, label: string) => {
+    if (timerRef.current) clearInterval(timerRef.current);
+    setTimerLeft(secs);
+    setTimerTotal(secs);
+    setTimerLabel(label);
+    timerRef.current = setInterval(() => {
+      setTimerLeft((prev) => {
+        if (prev <= 1) {
+          clearInterval(timerRef.current!);
+          timerRef.current = null;
+          playBeep();
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+  };
+
+  const stopTimer = () => {
+    if (timerRef.current) clearInterval(timerRef.current);
+    timerRef.current = null;
+    setTimerLeft(0);
+    setTimerTotal(0);
+  };
+
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => () => { if (timerRef.current) clearInterval(timerRef.current); }, []);
+
+  const searchFood = async (query?: string) => {
+    const q = (query ?? foodQuery).trim();
+    if (!q) return;
+    if (query) setFoodQuery(query);
+    setFoodLoading(true);
+    setFoodSearched(true);
+    setFoodResults([]);
+    setExpandedFood(null);
+    setPortionGrams("100");
+    try {
+      const res = await fetch(
+        `https://world.openfoodfacts.org/cgi/search.pl?search_terms=${encodeURIComponent(q)}&search_simple=1&action=process&json=1&page_size=12&lc=fr&fields=product_name,nutriments,brands,nutriscore_grade`
+      );
+      const data = await res.json();
+      const results = (data.products || []).filter(
+        (p: FoodResult) => p.product_name && p.nutriments?.["energy-kcal_100g"]
+      );
+      setFoodResults(results);
+      if (results.length > 0) {
+        setRecentSearches((prev) => [q, ...prev.filter((s) => s !== q)].slice(0, 5));
+      }
+    } catch {
+      setFoodResults([]);
+    }
+    setFoodLoading(false);
+  };
+
+  const toggleFoodFavorite = (food: FoodResult) => {
+    setFoodFavorites((prev) => {
+      const exists = prev.some((f) => f.product_name === food.product_name && f.brands === food.brands);
+      return exists ? prev.filter((f) => !(f.product_name === food.product_name && f.brands === food.brands)) : [food, ...prev];
+    });
+  };
+
+  const isFoodFavorite = (food: FoodResult) =>
+    foodFavorites.some((f) => f.product_name === food.product_name && f.brands === food.brands);
+
+  const NUTRISCORE_COLOR: Record<string, string> = { a: "#00AF00", b: "#85BB2F", c: "#FFCC00", d: "#FF6600", e: "#FF2D00" };
+
+  const addPendingSet = () => {
+    const kg = parseFloat(logKg.replace(",", "."));
+    const reps = parseInt(logReps);
+    if (!isNaN(kg) && !isNaN(reps) && kg > 0 && reps > 0) {
+      setPendingExoSets((prev) => [...prev, { kg, reps }]);
+      setLogKg("");
+      setLogReps("");
+    }
+  };
+
+  const savePendingSession = (exoName: string) => {
+    if (pendingExoSets.length === 0) return;
+    setWorkoutLog((prev) => {
+      const filtered = prev.filter((e) => !(e.exercise === exoName && e.date === todayStr));
+      return [...filtered, { date: todayStr, muscle: daySchedule.muscle, exercise: exoName, sets: pendingExoSets }];
+    });
+    setPendingExoSets([]);
+  };
+
+  const openExo = (i: number | null) => {
+    setExpandedExo(i);
+    setPendingExoSets([]);
+    setLogKg("");
+    setLogReps("");
+    setEditingSet(null);
+  };
+
+  const startEditSet = (exercise: string, date: string, idx: number, kg: number, reps: number) => {
+    setEditingSet({ exercise, date, idx });
+    setEditSetKg(String(kg));
+    setEditSetReps(String(reps));
+  };
+
+  const saveEditSet = () => {
+    if (!editingSet) return;
+    const kg = parseFloat(editSetKg.replace(",", "."));
+    const reps = parseInt(editSetReps);
+    if (isNaN(kg) || isNaN(reps) || kg <= 0 || reps <= 0) return;
+    setWorkoutLog((prev) =>
+      prev.map((e) =>
+        e.exercise === editingSet.exercise && e.date === editingSet.date
+          ? { ...e, sets: e.sets.map((s, i) => (i === editingSet.idx ? { kg, reps } : s)) }
+          : e
+      )
+    );
+    setEditingSet(null);
+  };
+
+  const deleteSetFromLog = (exercise: string, date: string, idx: number) => {
+    setWorkoutLog((prev) =>
+      prev
+        .map((e) =>
+          e.exercise === exercise && e.date === date
+            ? { ...e, sets: e.sets.filter((_, i) => i !== idx) }
+            : e
+        )
+        .filter((e) => e.sets.length > 0)
+    );
+    if (editingSet?.exercise === exercise && editingSet?.date === date && editingSet?.idx === idx) {
+      setEditingSet(null);
+    }
+  };
+
+  const deleteSession = (exercise: string, date: string) => {
+    setWorkoutLog((prev) => prev.filter((e) => !(e.exercise === exercise && e.date === date)));
+    setEditingSet(null);
+  };
+
+  const deletePendingSet = (idx: number) => {
+    setPendingExoSets((prev) => prev.filter((_, i) => i !== idx));
   };
 
   const inputStyle: CSSProperties = {
@@ -473,7 +829,7 @@ export default function App() {
         "--bg-raised": "#17172A",
         "--bg-dim": "rgba(255,255,255,0.05)",
         "--text": "#E4E4F0",
-        "--dim": "#484862",
+        "--dim": "#8080A8",
         "--border": "rgba(255,255,255,0.07)",
         "--accent": "#BEFF00",
         "--accent2": "#4DAAFF",
@@ -559,6 +915,13 @@ export default function App() {
               hint={latestWeight ? `Pesée : ${formatFrDate(latestWeight.date)}` : "Ajoute une pesée → Suivi"}
             />
             <StatCard label="Taille" value="1.80" unit="m" color="#4DAAFF" hint="Référence" />
+            <StatCard
+              label="IMC"
+              value={imc ? imc.toFixed(1) : "—"}
+              unit=""
+              color="#FF7033"
+              hint={imc ? (imc < 18.5 ? "Sous-poids" : imc < 25 ? "Normal" : "Surpoids") : "Ajoute une pesée"}
+            />
             <StatCard label="Objectif" value="~2400" unit="kcal/j" color="#FF3B5C" />
             <StatCard label="Protéines" value="~180" unit="g/j" color="#A07AF5" />
           </div>
@@ -933,11 +1296,14 @@ export default function App() {
               {WORKOUT_DETAILS[daySchedule.muscle as keyof typeof WORKOUT_DETAILS] ? (
                 WORKOUT_DETAILS[daySchedule.muscle as keyof typeof WORKOUT_DETAILS].map((exo, i) => {
                   const isOpen = expandedExo === i;
+                  const lastSession = [...workoutLog]
+                    .filter((e) => e.exercise === exo.name)
+                    .sort((a, b) => b.date.localeCompare(a.date))[0];
                   return (
                     <button
                       key={exo.name}
                       type="button"
-                      onClick={() => setExpandedExo(isOpen ? null : i)}
+                      onClick={() => openExo(isOpen ? null : i)}
                       aria-expanded={isOpen}
                       style={{
                         width: "100%",
@@ -1003,6 +1369,14 @@ export default function App() {
                           </div>
                         </div>
                         <div
+                          role="button"
+                          tabIndex={0}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            startTimer(parseRestSeconds(exo.rest), exo.name);
+                          }}
+                          onKeyDown={(e) => { if (e.key === "Enter") { e.stopPropagation(); startTimer(parseRestSeconds(exo.rest), exo.name); } }}
+                          aria-label={`Lancer le timer de repos — ${exo.rest}`}
                           style={{
                             fontSize: 9,
                             fontFamily: "var(--font-mono)",
@@ -1011,25 +1385,162 @@ export default function App() {
                             flexShrink: 0,
                             textTransform: "uppercase",
                             letterSpacing: "0.08em",
+                            cursor: "pointer",
+                            background: `${daySchedule.color}15`,
+                            border: `1px solid ${daySchedule.color}40`,
+                            borderRadius: 2,
+                            padding: "4px 8px",
                           }}
                         >
-                          REPOS {exo.rest}
+                          ⏱ {exo.rest}
                         </div>
                       </div>
                       {isOpen && (
                         <div
-                          style={{
-                            marginTop: 12,
-                            paddingTop: 12,
-                            borderTop: "1px solid var(--border)",
-                            fontSize: 13,
-                            color: "var(--accent2)",
-                            lineHeight: 1.6,
-                            fontFamily: "var(--font-body)",
-                            fontStyle: "italic",
-                          }}
+                          style={{ marginTop: 12, paddingTop: 12, borderTop: "1px solid var(--border)" }}
+                          onClick={(e) => e.stopPropagation()}
                         >
-                          {exo.note}
+                          <div style={{ fontSize: 13, color: "var(--accent2)", lineHeight: 1.6, fontFamily: "var(--font-body)", fontStyle: "italic", marginBottom: 14 }}>
+                            {exo.note}
+                          </div>
+
+                          {/* Last session — editable */}
+                          {lastSession && (
+                            <div style={{ marginBottom: 12, background: "var(--bg)", borderRadius: 2, padding: "10px 12px", border: "1px solid var(--border)" }}>
+                              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+                                <div style={{ fontSize: 9, color: "var(--dim)", fontFamily: "var(--font-mono)", textTransform: "uppercase", letterSpacing: "0.08em" }}>
+                                  Dernière séance · {formatFrDate(lastSession.date)}
+                                </div>
+                                <button
+                                  type="button"
+                                  onClick={() => deleteSession(lastSession.exercise, lastSession.date)}
+                                  style={{ background: "transparent", border: "1px solid rgba(255,59,92,0.25)", borderRadius: 2, color: "var(--accent3)", fontFamily: "var(--font-mono)", fontSize: 8, cursor: "pointer", padding: "3px 7px", textTransform: "uppercase", letterSpacing: "0.08em" }}
+                                >
+                                  Supprimer séance
+                                </button>
+                              </div>
+                              <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+                                {lastSession.sets.map((s, si) => {
+                                  const isEditing = editingSet?.exercise === lastSession.exercise && editingSet?.date === lastSession.date && editingSet?.idx === si;
+                                  return (
+                                    <div key={si} style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                                      <span style={{ fontSize: 9, color: "var(--dim)", fontFamily: "var(--font-mono)", minWidth: 18 }}>S{si + 1}</span>
+                                      {isEditing ? (
+                                        <>
+                                          <input
+                                            type="number"
+                                            aria-label="Poids (kg)"
+                                            value={editSetKg}
+                                            onChange={(e) => setEditSetKg(e.target.value)}
+                                            style={{ ...inputStyle, width: 60, padding: "4px 7px", fontSize: 11 }}
+                                            autoFocus
+                                          />
+                                          <span style={{ color: "var(--dim)", fontSize: 11, fontFamily: "var(--font-mono)" }}>×</span>
+                                          <input
+                                            type="number"
+                                            aria-label="Répétitions"
+                                            value={editSetReps}
+                                            onChange={(e) => setEditSetReps(e.target.value)}
+                                            onKeyDown={(e) => { if (e.key === "Enter") saveEditSet(); if (e.key === "Escape") setEditingSet(null); }}
+                                            style={{ ...inputStyle, width: 60, padding: "4px 7px", fontSize: 11 }}
+                                          />
+                                          <button type="button" onClick={saveEditSet} style={{ background: daySchedule.color, border: "none", borderRadius: 2, color: "#0A0A0E", fontFamily: "var(--font-mono)", fontSize: 9, cursor: "pointer", padding: "4px 8px", fontWeight: 700 }}>OK</button>
+                                          <button type="button" aria-label="Annuler la modification" onClick={() => setEditingSet(null)} style={{ background: "transparent", border: "1px solid var(--border)", borderRadius: 2, color: "var(--dim)", fontFamily: "var(--font-mono)", fontSize: 9, cursor: "pointer", padding: "4px 8px" }}>✕</button>
+                                        </>
+                                      ) : (
+                                        <>
+                                          <span style={{ background: `${daySchedule.color}18`, border: `1px solid ${daySchedule.color}35`, borderRadius: 2, padding: "3px 8px", fontSize: 10, fontFamily: "var(--font-mono)", color: daySchedule.color, flex: 1 }}>
+                                            {s.kg} kg × {s.reps} reps
+                                          </span>
+                                          <button
+                                            type="button"
+                                            onClick={() => startEditSet(lastSession.exercise, lastSession.date, si, s.kg, s.reps)}
+                                            style={{ background: "transparent", border: "1px solid var(--border)", borderRadius: 2, color: "var(--dim)", fontFamily: "var(--font-mono)", fontSize: 9, cursor: "pointer", padding: "3px 7px" }}
+                                            aria-label={`Modifier la série ${si + 1}`}
+                                          >
+                                            ✏
+                                          </button>
+                                          <button
+                                            type="button"
+                                            onClick={() => deleteSetFromLog(lastSession.exercise, lastSession.date, si)}
+                                            style={{ background: "transparent", border: "1px solid rgba(255,59,92,0.25)", borderRadius: 2, color: "var(--accent3)", fontFamily: "var(--font-mono)", fontSize: 9, cursor: "pointer", padding: "3px 7px" }}
+                                            aria-label={`Supprimer la série ${si + 1}`}
+                                          >
+                                            ✕
+                                          </button>
+                                        </>
+                                      )}
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            </div>
+                          )}
+
+                          {/* Pending sets — deletable */}
+                          {pendingExoSets.length > 0 && (
+                            <div style={{ marginBottom: 10 }}>
+                              <div style={{ fontSize: 9, color: "var(--accent)", fontFamily: "var(--font-mono)", marginBottom: 6, textTransform: "uppercase", letterSpacing: "0.08em" }}>
+                                Cette séance (non sauvegardée)
+                              </div>
+                              <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+                                {pendingExoSets.map((s, si) => (
+                                  <div key={si} style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                                    <span style={{ fontSize: 9, color: "var(--dim)", fontFamily: "var(--font-mono)", minWidth: 18 }}>S{si + 1}</span>
+                                    <span style={{ background: "rgba(190,255,0,0.1)", border: "1px solid rgba(190,255,0,0.25)", borderRadius: 2, padding: "3px 8px", fontSize: 10, fontFamily: "var(--font-mono)", color: "var(--accent)", flex: 1 }}>
+                                      {s.kg} kg × {s.reps} reps
+                                    </span>
+                                    <button
+                                      type="button"
+                                      onClick={() => deletePendingSet(si)}
+                                      style={{ background: "transparent", border: "1px solid rgba(255,59,92,0.25)", borderRadius: 2, color: "var(--accent3)", fontFamily: "var(--font-mono)", fontSize: 9, cursor: "pointer", padding: "3px 7px" }}
+                                      aria-label={`Supprimer la série en attente ${si + 1}`}
+                                    >
+                                      ✕
+                                    </button>
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+
+                          {/* Add set form */}
+                          <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+                            <input
+                              type="number"
+                              placeholder="kg"
+                              aria-label="Poids de la série (kg)"
+                              value={logKg}
+                              onChange={(e) => setLogKg(e.target.value)}
+                              style={{ ...inputStyle, width: 70, padding: "7px 10px", fontSize: 12 }}
+                            />
+                            <span style={{ color: "var(--dim)", fontSize: 12, fontFamily: "var(--font-mono)" }}>×</span>
+                            <input
+                              type="number"
+                              placeholder="reps"
+                              aria-label="Nombre de répétitions"
+                              value={logReps}
+                              onChange={(e) => setLogReps(e.target.value)}
+                              onKeyDown={(e) => { if (e.key === "Enter") addPendingSet(); }}
+                              style={{ ...inputStyle, width: 70, padding: "7px 10px", fontSize: 12 }}
+                            />
+                            <button
+                              type="button"
+                              onClick={addPendingSet}
+                              style={{ padding: "7px 12px", background: daySchedule.color, border: "none", borderRadius: 2, color: "#0A0A0E", fontFamily: "var(--font-mono)", fontSize: 10, cursor: "pointer", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.06em" }}
+                            >
+                              + Série
+                            </button>
+                            {pendingExoSets.length > 0 && (
+                              <button
+                                type="button"
+                                onClick={() => savePendingSession(exo.name)}
+                                style={{ padding: "7px 12px", background: "transparent", border: `1px solid ${daySchedule.color}`, borderRadius: 2, color: daySchedule.color, fontFamily: "var(--font-mono)", fontSize: 10, cursor: "pointer", textTransform: "uppercase", letterSpacing: "0.06em" }}
+                              >
+                                Sauvegarder
+                              </button>
+                            )}
+                          </div>
                         </div>
                       )}
                     </button>
@@ -1550,8 +2061,280 @@ export default function App() {
               )}
             </div>
           )}
+          {/* ============ ALIMENTS TAB ============ */}
+          {activeTab === "aliments" && (
+            <div>
+              <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: "clamp(14px, 3vw, 22px)" }}>
+                <div style={{ width: 3, height: 22, background: "var(--accent)", flexShrink: 0 }} />
+                <h2 className="app-section-title" style={{ fontFamily: "var(--font-display)", fontWeight: 900, margin: 0, textTransform: "uppercase", letterSpacing: "-0.01em" }}>
+                  Infos nutritionnelles
+                </h2>
+              </div>
+
+              {/* Search bar */}
+              <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+                <input
+                  type="text"
+                  aria-label="Rechercher un aliment"
+                  value={foodQuery}
+                  onChange={(e) => setFoodQuery(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === "Enter") searchFood(); }}
+                  placeholder="ex. flocons d'avoine, poulet, skyr..."
+                  style={{ ...inputStyle, flex: 1 }}
+                />
+                <button
+                  type="button"
+                  onClick={() => searchFood()}
+                  disabled={foodLoading}
+                  style={{ padding: "10px 20px", background: "var(--accent)", border: "none", borderRadius: 2, color: "#0A0A0E", fontFamily: "var(--font-display)", fontSize: 13, fontWeight: 800, cursor: foodLoading ? "not-allowed" : "pointer", textTransform: "uppercase", letterSpacing: "0.06em", flexShrink: 0, opacity: foodLoading ? 0.6 : 1 }}
+                >
+                  {foodLoading ? "..." : "Chercher"}
+                </button>
+              </div>
+
+              {/* Recent searches */}
+              {recentSearches.length > 0 && !foodLoading && (
+                <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 16 }}>
+                  {recentSearches.map((s) => (
+                    <button
+                      key={s}
+                      type="button"
+                      onClick={() => searchFood(s)}
+                      style={{ background: "var(--bg-card)", border: "1px solid var(--border)", borderRadius: 2, color: "var(--dim)", fontFamily: "var(--font-mono)", fontSize: 9, cursor: "pointer", padding: "4px 10px", textTransform: "uppercase", letterSpacing: "0.07em" }}
+                    >
+                      {s}
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              {/* Favorites */}
+              {foodFavorites.length > 0 && (
+                <div style={{ marginBottom: 20 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+                    <div style={{ width: 3, height: 16, background: "#FFD426", flexShrink: 0 }} />
+                    <span style={{ fontFamily: "var(--font-mono)", fontSize: 9, color: "#FFD426", textTransform: "uppercase", letterSpacing: "0.1em" }}>Mes favoris</span>
+                  </div>
+                  {foodFavorites.map((food, i) => {
+                    const n = food.nutriments;
+                    const g = 100;
+                    return (
+                      <div key={i} style={{ background: "var(--bg-card)", borderRadius: 2, padding: "10px 14px", marginBottom: 6, border: "1px solid var(--border)", borderLeft: "3px solid #FFD426", display: "flex", alignItems: "center", gap: 12 }}>
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ fontFamily: "var(--font-display)", fontSize: "clamp(12px, 2.5vw, 14px)", fontWeight: 800, textTransform: "uppercase", letterSpacing: "0.01em" }}>{food.product_name}</div>
+                          {food.brands && <div style={{ fontSize: 9, color: "var(--dim)", fontFamily: "var(--font-mono)", textTransform: "uppercase", marginTop: 2 }}>{food.brands}</div>}
+                        </div>
+                        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", justifyContent: "flex-end" }}>
+                          {[
+                            { v: Math.round(n["energy-kcal_100g"] * g / 100), u: "kcal", c: "#FF3B5C" },
+                            { v: `${((n.proteins_100g ?? 0) * g / 100).toFixed(1)}g`, u: "P", c: "#A07AF5" },
+                            { v: `${((n.carbohydrates_100g ?? 0) * g / 100).toFixed(1)}g`, u: "G", c: "#FFD426" },
+                            { v: `${((n.fat_100g ?? 0) * g / 100).toFixed(1)}g`, u: "L", c: "#FF7033" },
+                          ].map((m) => (
+                            <span key={m.u} style={{ fontSize: 10, fontFamily: "var(--font-mono)", color: m.c, fontWeight: 700 }}>{m.v} <span style={{ color: "var(--dim)", fontWeight: 400 }}>{m.u}</span></span>
+                          ))}
+                        </div>
+                        <button type="button" onClick={() => toggleFoodFavorite(food)} aria-label="Retirer des favoris" style={{ background: "transparent", border: "none", color: "#FFD426", fontSize: 16, cursor: "pointer", flexShrink: 0, padding: 2 }}>★</button>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
+              {/* Loading / results region — aria-live pour screen readers */}
+              <div aria-live="polite" aria-atomic="false">
+              {foodLoading && (
+                <div role="status" style={{ textAlign: "center", padding: 48, color: "var(--dim)", fontFamily: "var(--font-mono)", fontSize: 11, textTransform: "uppercase", letterSpacing: "0.1em" }}>
+                  Chargement...
+                </div>
+              )}
+
+              {/* No results */}
+              {!foodLoading && foodSearched && foodResults.length === 0 && (
+                <div style={{ textAlign: "center", padding: 48, color: "var(--dim)", fontFamily: "var(--font-mono)", fontSize: 11, lineHeight: 1.8 }}>
+                  Aucun résultat pour "{foodQuery}".<br />Essaie un autre terme — ex: "avoine", "blanc de poulet", "skyr"
+                </div>
+              )}
+
+              {/* Results */}
+              {!foodLoading && foodResults.map((food, i) => {
+                const n = food.nutriments;
+                const isOpen = expandedFood === i;
+                const g = parseFloat(portionGrams) || 100;
+                const score = food.nutriscore_grade?.toLowerCase();
+                const scoreColor = score ? (NUTRISCORE_COLOR[score] ?? "var(--dim)") : null;
+                const macros = [
+                  { label: "Kcal", value: Math.round(n["energy-kcal_100g"] * g / 100), raw: n["energy-kcal_100g"], color: "#FF3B5C" },
+                  { label: "Protéines", value: `${((n.proteins_100g ?? 0) * g / 100).toFixed(1)}g`, raw: n.proteins_100g, color: "#A07AF5" },
+                  { label: "Glucides", value: `${((n.carbohydrates_100g ?? 0) * g / 100).toFixed(1)}g`, raw: n.carbohydrates_100g, color: "#FFD426" },
+                  { label: "Lipides", value: `${((n.fat_100g ?? 0) * g / 100).toFixed(1)}g`, raw: n.fat_100g, color: "#FF7033" },
+                ];
+                const extras = [
+                  n.sugars_100g != null && { label: "Sucres", value: `${(n.sugars_100g * g / 100).toFixed(1)}g`, color: "#FF7033" },
+                  n.fiber_100g != null && { label: "Fibres", value: `${(n.fiber_100g * g / 100).toFixed(1)}g`, color: "#4DAAFF" },
+                  n.salt_100g != null && { label: "Sel", value: `${(n.salt_100g * g / 100).toFixed(2)}g`, color: "#84848C" },
+                ].filter(Boolean) as { label: string; value: string; color: string }[];
+                const fav = isFoodFavorite(food);
+
+                return (
+                  <div key={i} style={{ background: "var(--bg-card)", borderRadius: 2, marginBottom: 8, border: "1px solid var(--border)", borderLeft: `3px solid var(--accent)`, overflow: "hidden" }}>
+                    {/* Header row — clickable */}
+                    <button
+                      type="button"
+                      onClick={() => { setExpandedFood(isOpen ? null : i); setPortionGrams("100"); }}
+                      style={{ width: "100%", textAlign: "left", background: "transparent", border: "none", padding: "14px 16px", cursor: "pointer", color: "inherit", font: "inherit", display: "flex", alignItems: "flex-start", gap: 12 }}
+                    >
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontFamily: "var(--font-display)", fontSize: "clamp(13px, 3vw, 16px)", fontWeight: 800, textTransform: "uppercase", letterSpacing: "0.01em" }}>
+                          {food.product_name}
+                        </div>
+                        <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 4, flexWrap: "wrap" }}>
+                          {food.brands && (
+                            <span style={{ fontSize: 9, color: "var(--dim)", fontFamily: "var(--font-mono)", textTransform: "uppercase", letterSpacing: "0.07em" }}>{food.brands}</span>
+                          )}
+                          {scoreColor && score && (
+                            <span style={{ background: scoreColor, color: "#fff", fontFamily: "var(--font-display)", fontSize: 9, fontWeight: 900, padding: "2px 6px", borderRadius: 2, textTransform: "uppercase", letterSpacing: "0.1em" }}>
+                              Nutri-Score {score.toUpperCase()}
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
+                        <span style={{ fontFamily: "var(--font-mono)", fontSize: 9, color: "var(--accent)", letterSpacing: "0.08em" }}>{Math.round(n["energy-kcal_100g"])} kcal/100g</span>
+                        <span style={{ color: "var(--dim)", fontSize: 11 }}>{isOpen ? "▲" : "▼"}</span>
+                      </div>
+                    </button>
+
+                    {/* Expanded section */}
+                    {isOpen && (
+                      <div style={{ padding: "0 16px 16px", borderTop: "1px solid var(--border)" }}>
+
+                        {/* Portion calculator */}
+                        <div style={{ display: "flex", alignItems: "center", gap: 10, margin: "14px 0 14px", flexWrap: "wrap" }}>
+                          <span style={{ fontFamily: "var(--font-mono)", fontSize: 9, color: "var(--dim)", textTransform: "uppercase", letterSpacing: "0.1em" }}>Quantité</span>
+                          <input
+                            type="number"
+                            aria-label="Quantité en grammes"
+                            value={portionGrams}
+                            onChange={(e) => setPortionGrams(e.target.value)}
+                            min={1}
+                            style={{ ...inputStyle, width: 80, padding: "6px 10px", fontSize: 13, fontWeight: 700 }}
+                          />
+                          <span style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--dim)" }}>g</span>
+                          {[50, 100, 150, 200].map((preset) => (
+                            <button
+                              key={preset}
+                              type="button"
+                              onClick={() => setPortionGrams(String(preset))}
+                              style={{ background: portionGrams === String(preset) ? "var(--accent)" : "var(--bg)", border: "1px solid var(--border)", borderRadius: 2, color: portionGrams === String(preset) ? "#0A0A0E" : "var(--dim)", fontFamily: "var(--font-mono)", fontSize: 9, cursor: "pointer", padding: "5px 10px", fontWeight: portionGrams === String(preset) ? 700 : 400 }}
+                            >
+                              {preset}g
+                            </button>
+                          ))}
+                        </div>
+
+                        {/* Macros */}
+                        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: extras.length > 0 ? 10 : 0 }}>
+                          {macros.map((m) => (
+                            <div key={m.label} style={{ background: `${m.color}12`, border: `1px solid ${m.color}30`, borderRadius: 2, padding: "8px 12px", textAlign: "center", flex: "1 1 70px" }}>
+                              <div style={{ fontSize: 16, fontWeight: 700, color: m.color, fontFamily: "var(--font-mono)" }}>{m.value}</div>
+                              <div style={{ fontSize: 8, color: "var(--dim)", fontFamily: "var(--font-mono)", textTransform: "uppercase", letterSpacing: "0.08em", marginTop: 3 }}>{m.label}</div>
+                            </div>
+                          ))}
+                        </div>
+
+                        {/* Extras */}
+                        {extras.length > 0 && (
+                          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 14 }}>
+                            {extras.map((m) => (
+                              <span key={m.label} style={{ background: `${m.color}10`, border: `1px solid ${m.color}25`, borderRadius: 2, padding: "4px 9px", fontSize: 10, fontFamily: "var(--font-mono)", color: m.color }}>
+                                {m.label} {m.value}
+                              </span>
+                            ))}
+                          </div>
+                        )}
+
+                        {/* Favorite button */}
+                        <button
+                          type="button"
+                          onClick={() => toggleFoodFavorite(food)}
+                          style={{ background: fav ? "rgba(255,212,38,0.1)" : "transparent", border: `1px solid ${fav ? "rgba(255,212,38,0.4)" : "var(--border)"}`, borderRadius: 2, color: fav ? "#FFD426" : "var(--dim)", fontFamily: "var(--font-mono)", fontSize: 10, cursor: "pointer", padding: "7px 14px", textTransform: "uppercase", letterSpacing: "0.07em" }}
+                        >
+                          {fav ? "★ Favori" : "☆ Ajouter aux favoris"}
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+              </div>{/* end aria-live */}
+            </div>
+          )}
+
         </main>
       </div>
+
+      {/* ============ FLOATING TIMER ============ */}
+      {timerLeft > 0 && (
+        <div
+          role="status"
+          aria-live="polite"
+          aria-label={`Timer de repos — ${formatTimer(timerLeft)} restant`}
+          style={{
+            position: "fixed",
+            bottom: "max(20px, env(safe-area-inset-bottom, 20px))",
+            left: "50%",
+            transform: "translateX(-50%)",
+            background: "#10101A",
+            border: "1px solid rgba(190,255,0,0.25)",
+            borderRadius: 4,
+            padding: "12px 20px",
+            display: "flex",
+            alignItems: "center",
+            gap: 16,
+            zIndex: 100,
+            boxShadow: "0 4px 32px rgba(0,0,0,0.6)",
+            minWidth: 260,
+          }}
+        >
+          {/* Progress ring */}
+          <svg width={44} height={44} style={{ flexShrink: 0 }}>
+            <circle cx={22} cy={22} r={18} fill="none" stroke="rgba(255,255,255,0.06)" strokeWidth={3} />
+            <circle
+              cx={22} cy={22} r={18}
+              fill="none"
+              stroke="#BEFF00"
+              strokeWidth={3}
+              strokeLinecap="round"
+              strokeDasharray={2 * Math.PI * 18}
+              strokeDashoffset={2 * Math.PI * 18 * (timerLeft / timerTotal)}
+              transform="rotate(-90 22 22)"
+              style={{ transition: "stroke-dashoffset 0.9s linear" }}
+            />
+            <text x={22} y={26} textAnchor="middle" fill="#BEFF00" fontSize={11} fontWeight={700} fontFamily="IBM Plex Mono, monospace">
+              {formatTimer(timerLeft)}
+            </text>
+          </svg>
+
+          <div style={{ minWidth: 0, flex: 1 }}>
+            <div style={{ fontSize: 9, color: "var(--dim)", fontFamily: "var(--font-mono)", textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: 2 }}>
+              Repos — {timerLabel}
+            </div>
+            <div style={{ fontSize: 18, fontWeight: 900, fontFamily: "var(--font-display)", color: "var(--accent)", letterSpacing: "-0.01em", textTransform: "uppercase" }}>
+              {formatTimer(timerLeft)}
+            </div>
+          </div>
+
+          <button
+            type="button"
+            onClick={stopTimer}
+            style={{ background: "transparent", border: "1px solid rgba(255,59,92,0.3)", borderRadius: 2, color: "var(--accent3)", fontFamily: "var(--font-mono)", fontSize: 9, cursor: "pointer", padding: "5px 10px", textTransform: "uppercase", letterSpacing: "0.08em", flexShrink: 0 }}
+          >
+            Annuler
+          </button>
+        </div>
+      )}
+
     </div>
   );
 }
