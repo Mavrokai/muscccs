@@ -1,0 +1,360 @@
+/* Mobile-first layout — base = téléphone, puis tablette / desktop */
+
+:root {
+  --layout-max: 100%;
+  --layout-pad-x: clamp(12px, 4.5vw, 28px);
+  --layout-pad-bottom: max(88px, calc(20px + env(safe-area-inset-bottom, 0px)));
+  --layout-radius: 2px;
+  --layout-radius-lg: 4px;
+}
+
+/* Tablette portrait */
+@media (min-width: 600px) {
+  :root {
+    --layout-max: min(100%, 640px);
+  }
+}
+
+/* Tablette paysage / petit desktop */
+@media (min-width: 768px) {
+  :root {
+    --layout-max: min(100%, 760px);
+  }
+}
+
+/* Desktop */
+@media (min-width: 1024px) {
+  :root {
+    --layout-max: min(100%, 1180px);
+  }
+}
+
+@media (min-width: 1280px) {
+  :root {
+    --layout-max: min(100%, 1320px);
+  }
+}
+
+@media (min-width: 1536px) {
+  :root {
+    --layout-max: min(100%, 1440px);
+  }
+}
+
+.app-shell {
+  width: 100%;
+  max-width: var(--layout-max);
+  margin-left: auto;
+  margin-right: auto;
+  padding-left: var(--layout-pad-x);
+  padding-right: var(--layout-pad-x);
+  padding-bottom: var(--layout-pad-bottom);
+  padding-top: max(0px, env(safe-area-inset-top, 0px));
+  box-sizing: border-box;
+}
+
+/* Mobile / tablette : pile verticale */
+.app-layout {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  width: 100%;
+}
+
+.app-layout-main {
+  min-width: 0;
+  flex: 1;
+}
+
+/* Desktop : sidebar à gauche */
+@media (min-width: 1100px) {
+  .app-layout {
+    display: grid;
+    grid-template-columns: minmax(240px, 300px) minmax(0, 1fr);
+    gap: clamp(20px, 2.5vw, 36px);
+    align-items: start;
+  }
+
+  .app-layout-sidebar {
+    position: sticky;
+    top: max(8px, env(safe-area-inset-top, 0px));
+    align-self: start;
+  }
+
+  .app-layout-sidebar .app-stats-grid {
+    grid-template-columns: 1fr;
+    margin-top: 0;
+  }
+}
+
+.app-header {
+  padding: clamp(18px, 4vw, 28px) 0 clamp(10px, 2vw, 16px);
+}
+
+.app-stats-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: clamp(6px, 1.5vw, 10px);
+  margin: clamp(8px, 2vw, 14px) 0 clamp(16px, 3vw, 22px);
+}
+
+@media (min-width: 700px) {
+  .app-stats-grid {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+
+.app-tab-nav {
+  display: flex;
+  background: var(--bg-card);
+  gap: 2px;
+  margin-bottom: clamp(14px, 3vw, 22px);
+  overflow-x: auto;
+  overflow-y: hidden;
+  -webkit-overflow-scrolling: touch;
+  scroll-snap-type: x proximity;
+  scrollbar-width: none;
+  border-radius: var(--layout-radius-lg);
+  padding: 3px;
+  border: 1px solid var(--border);
+}
+
+.app-tab-nav::-webkit-scrollbar {
+  display: none;
+}
+
+.app-tab-btn {
+  flex: 1 1 auto;
+  min-width: clamp(60px, 16vw, 88px);
+  scroll-snap-align: start;
+  padding: clamp(8px, 2vw, 11px) clamp(4px, 1.2vw, 8px);
+  border-radius: var(--layout-radius);
+  border: none;
+  font-size: clamp(10px, 2.4vw, 12px);
+  white-space: nowrap;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: clamp(2px, 0.6vw, 4px);
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+  font-family: var(--font-display);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  touch-action: manipulation;
+}
+
+.app-tab-btn .app-tab-icon {
+  font-size: clamp(14px, 3.5vw, 17px);
+  line-height: 1;
+}
+
+.app-day-toolbar {
+  display: flex;
+  justify-content: flex-start;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.app-day-toolbar-hint {
+  font-size: 9px;
+  color: var(--dim);
+  font-family: var(--font-mono);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+
+@media (max-width: 380px) {
+  .app-day-toolbar-hint {
+    width: 100%;
+  }
+}
+
+.app-day-row {
+  display: flex;
+  gap: clamp(2px, 0.8vw, 6px);
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding-bottom: 6px;
+  -webkit-overflow-scrolling: touch;
+  scroll-snap-type: x proximity;
+  margin: 0 calc(-1 * min(4px, var(--layout-pad-x)));
+  padding-left: min(4px, var(--layout-pad-x));
+  padding-right: min(4px, var(--layout-pad-x));
+}
+
+.app-day-btn {
+  flex: 0 0 auto;
+  min-width: clamp(44px, 11vw, 58px);
+  scroll-snap-align: start;
+  padding: clamp(7px, 1.8vw, 10px) clamp(3px, 0.8vw, 5px);
+  border-radius: var(--layout-radius);
+  font-size: clamp(9px, 2.2vw, 11px);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s, color 0.15s;
+  font-family: var(--font-mono);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  touch-action: manipulation;
+}
+
+@media (min-width: 700px) {
+  .app-day-btn {
+    flex: 1 1 0;
+    min-width: 0;
+  }
+}
+
+.app-today-btn {
+  padding: 5px 12px;
+  border-radius: var(--layout-radius);
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 600;
+  cursor: pointer;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  touch-action: manipulation;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.app-today-btn:hover {
+  border-color: var(--accent);
+  background: rgba(190, 255, 0, 0.06);
+}
+
+/* Macros */
+.macro-bar-row {
+  display: flex;
+  align-items: center;
+  gap: clamp(8px, 2vw, 14px);
+  margin-bottom: clamp(8px, 2vw, 10px);
+  flex-wrap: wrap;
+}
+
+@media (max-width: 420px) {
+  .macro-bar-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .macro-bar-row .macro-bar-label {
+    width: 100% !important;
+  }
+
+  .macro-bar-row .macro-bar-value {
+    width: 100% !important;
+    text-align: left !important;
+  }
+}
+
+.app-grocery-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 8px;
+}
+
+@media (min-width: 480px) {
+  .app-grocery-grid {
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 200px), 1fr));
+  }
+}
+
+@media (min-width: 900px) {
+  .app-grocery-grid {
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  }
+}
+
+.app-suivi-form {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 10px;
+}
+
+.app-suivi-submit {
+  width: 100%;
+}
+
+@media (min-width: 520px) {
+  .app-suivi-form {
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: flex-end;
+  }
+
+  .app-suivi-form .app-suivi-field-date {
+    flex: 1 1 160px;
+  }
+
+  .app-suivi-form .app-suivi-field-kg {
+    flex: 1 1 120px;
+  }
+
+  .app-suivi-form .app-suivi-submit {
+    flex: 0 0 auto;
+    width: auto;
+  }
+}
+
+.app-section-title {
+  font-size: clamp(1.1rem, 4vw, 1.6rem);
+}
+
+.stat-card {
+  transition: transform 0.15s ease;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .stat-card:hover {
+    transform: translateY(-2px);
+  }
+}
+
+.macro-bar-track {
+  flex: 1;
+  min-width: 0;
+  height: 5px;
+  background: var(--bg-dim);
+  border-radius: 0;
+  overflow: hidden;
+}
+
+.app-card-pad {
+  padding: clamp(14px, 3.5vw, 20px);
+}
+
+.app-typo-sub {
+  font-size: clamp(10px, 2.5vw, 12px);
+}
+
+.app-training-row-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.app-card {
+  border-radius: var(--layout-radius-lg);
+}
+
+/* Safe area */
+@supports (padding: max(0px)) {
+  .app-shell {
+    padding-left: max(var(--layout-pad-x), env(safe-area-inset-left, 0px));
+    padding-right: max(var(--layout-pad-x), env(safe-area-inset-right, 0px));
+  }
+}
