@@ -1,6 +1,19 @@
 import { useState, useEffect, useCallback, useRef, type CSSProperties, type FormEvent } from "react";
 import { usePersistedState } from "./hooks/usePersistedState";
-import Anthropic from "@anthropic-ai/sdk";
+import { storageGet, storageSet } from "./lib/appStorage";
+import type { AppUser } from "./authTypes";
+
+/**
+ * Modèles essayés dans l’ordre (quotas distincts par modèle).
+ * gemini-2.0-flash est exclu : souvent « free_tier limit: 0 » sur certains projets.
+ * @see https://ai.google.dev/gemini-api/docs/models
+ */
+const GEMINI_MODEL_FALLBACKS = [
+  "gemini-2.5-flash-lite",
+  "gemini-2.0-flash-lite",
+  "gemini-1.5-flash",
+  "gemini-2.5-flash",
+];
 
 const DAYS = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi", "Dimanche"];
 const SHORT_DAYS = ["LUN", "MAR", "MER", "JEU", "VEN", "SAM", "DIM"];
@@ -21,6 +34,88 @@ function formatFrDate(iso: string): string {
   } catch {
     return iso;
   }
+}
+
+function getUserInitials(u: AppUser): string {
+  const s = (u.displayName || u.username).trim();
+  const parts = s.split(/\s+/).filter(Boolean);
+  if (parts.length >= 2) return (parts[0][0] + parts[1][0]).toUpperCase();
+  return s.slice(0, 2).toUpperCase();
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function isRetryableQuotaError(status: number, message: string): boolean {
+  if (status === 429) return true;
+  return /quota|rate limit|RESOURCE_EXHAUSTED|limit:\s*0|free_tier/i.test(message);
+}
+
+async function geminiGenerateTextOnce(
+  apiKey: string,
+  model: string,
+  prompt: string
+): Promise<{ ok: true; text: string } | { ok: false; status: number; message: string }> {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: { maxOutputTokens: 8192, temperature: 0.65 },
+    }),
+  });
+  if (!res.ok) {
+    let message = "";
+    try {
+      const j = await res.json();
+      message = j?.error?.message ?? JSON.stringify(j).slice(0, 420);
+    } catch {
+      message = await res.text();
+    }
+    return { ok: false, status: res.status, message: message || `Erreur HTTP ${res.status}` };
+  }
+  const data = await res.json();
+  const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!text || typeof text !== "string") return { ok: false, status: 200, message: "Réponse vide du modèle" };
+  return { ok: true, text };
+}
+
+async function geminiGenerateText(apiKey: string, prompt: string): Promise<string> {
+  let lastMessage = "";
+  for (const model of GEMINI_MODEL_FALLBACKS) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const r = await geminiGenerateTextOnce(apiKey, model, prompt);
+      if (r.ok) return r.text;
+      lastMessage = r.message;
+
+      const retrySec = r.message.match(/retry in ([\d.]+)\s*s/i);
+      if (isRetryableQuotaError(r.status, r.message) && retrySec && attempt === 0) {
+        const ms = Math.min(55_000, Math.ceil(parseFloat(retrySec[1]) * 1000) + 500);
+        await sleep(ms);
+        continue;
+      }
+
+      if (isRetryableQuotaError(r.status, r.message)) break;
+
+      if (r.status === 400 || r.status === 401 || r.status === 403) {
+        throw new Error(r.message);
+      }
+
+      if (r.status === 404 && /not found|NOT_FOUND/i.test(r.message)) break;
+
+      throw new Error(r.message);
+    }
+  }
+  throw new Error(
+    `${lastMessage}\n\n` +
+      `Aucun modèle disponible avec ton quota actuel.\n` +
+      `• Attends 1–2 minutes puis réessaie (fenêtre RPM).\n` +
+      `• Crée une nouvelle clé sur aistudio.google.com (nouveau projet = nouveaux quotas).\n` +
+      `• Ou active la facturation sur le projet Google Cloud lié à la clé (souvent nécessaire si « limit: 0 » partout).\n` +
+      `Doc : ai.google.dev/gemini-api/docs/rate-limits`
+  );
 }
 
 function smoothBezierPath(points: Array<{ x: number; y: number }>): string {
@@ -78,11 +173,53 @@ function computeWeeklyGain(weights: WeightEntry[]): number | null {
   return (data[data.length - 1].kg - data[0].kg) / (days / 7);
 }
 
-function computeTarget(weeklyGain: number | null, currentKg: number | null): { kcal: number; protein: number; reason: string } {
-  const kg = currentKg ?? 60;
-  const BASE = 2400;
+type NutritionGoal = "bulk" | "cut";
+
+type UserProfile = {
+  heightCm: number;
+  goal: NutritionGoal;
+  age: number;
+};
+
+/** TDEE homme, activité modérée (entraînement régulier). */
+function mifflinTdeeMale(kg: number, heightCm: number, age: number, activity = 1.55): number {
+  const bmr = 10 * kg + 6.25 * heightCm - 5 * age + 5;
+  return Math.round(bmr * activity);
+}
+
+function computeTarget(
+  weeklyGain: number | null,
+  currentKg: number | null,
+  profile: UserProfile
+): { kcal: number; protein: number; reason: string } {
+  const kg = currentKg ?? 70;
+  const heightCm = profile.heightCm > 0 ? profile.heightCm : 175;
+  const age = profile.age > 0 ? profile.age : 28;
+  const goal: NutritionGoal = profile.goal === "cut" ? "cut" : "bulk";
+  const tdee = mifflinTdeeMale(kg, heightCm, age, 1.55);
+
+  if (goal === "cut") {
+    let kcal = tdee - 400;
+    let reason = `Sèche · TDEE ~${tdee} kcal (Mifflin) · déficit modéré`;
+    if (weeklyGain !== null) {
+      if (weeklyGain < -0.55) {
+        kcal += 150;
+        reason += ` · perte >0,5 kg/sem → +150 kcal`;
+      } else if (weeklyGain > 0.12) {
+        kcal -= 100;
+        reason += ` · encore en surplus → -100 kcal`;
+      }
+    }
+    return {
+      kcal: Math.max(1350, Math.round(kcal)),
+      protein: Math.round(kg * 2.2),
+      reason,
+    };
+  }
+
+  const BASE = tdee + 200;
   const PROT = Math.round(kg * 3);
-  if (weeklyGain === null) return { kcal: BASE, protein: PROT, reason: "Données insuffisantes — objectifs de base" };
+  if (weeklyGain === null) return { kcal: BASE, protein: PROT, reason: `Prise de masse · TDEE ~${tdee} kcal — objectifs de base (${heightCm} cm, ${age} ans)` };
   if (weeklyGain < 0)     return { kcal: BASE + 300, protein: PROT + 20, reason: `Perte de ${Math.abs(weeklyGain).toFixed(2)} kg/sem → +300 kcal pour inverser` };
   if (weeklyGain < 0.2)   return { kcal: BASE + 200, protein: PROT + 15, reason: `+${weeklyGain.toFixed(2)} kg/sem insuffisant → +200 kcal` };
   if (weeklyGain < 0.35)  return { kcal: BASE + 100, protein: PROT + 10, reason: `+${weeklyGain.toFixed(2)} kg/sem légèrement faible → +100 kcal` };
@@ -279,39 +416,64 @@ const GROCERIES = [
   { item: "Pulpe de tomate", qty: "4 conserves", cat: "Sauces", icon: "🍅" },
 ];
 
+/** Prix indicatifs supermarché France (€ pour la quantité listée dans GROCERIES) — pas d’API fiable pour les prix en magasin. */
+const GROCERY_ESTIMATE_EUR: Record<string, number> = {
+  "Blanc de poulet": 16,
+  "Steak haché 5%": 20,
+  Saumon: 18,
+  "Thon (conserve)": 8,
+  Œufs: 7,
+  Skyr: 10,
+  Lait: 3,
+  "Flocons d'avoine": 5,
+  "Riz basmati": 9,
+  Pâtes: 4,
+  Bananes: 3,
+  Pommes: 4,
+  Ail: 3,
+  Oignons: 2,
+  "Pulpe de tomate": 5,
+};
+
+function estimateGroceryTotal(): { total: number; lines: { item: string; eur: number }[] } {
+  const lines = GROCERIES.map((g) => ({ item: g.item, eur: GROCERY_ESTIMATE_EUR[g.item] ?? 0 }));
+  const total = Math.round(lines.reduce((s, l) => s + l.eur, 0) * 100) / 100;
+  return { total, lines };
+}
+
 const GROCERY_DONE_KEY = "muscu-grocery-done";
 
 function useGroceryDone() {
   const [done, setDone] = useState<Record<string, boolean>>({});
+  const [hydrated, setHydrated] = useState(false);
 
   useEffect(() => {
-    try {
-      const raw = localStorage.getItem(GROCERY_DONE_KEY);
-      if (raw) setDone(JSON.parse(raw));
-    } catch {
-      /* ignore */
-    }
-  }, []);
-
-  const toggle = useCallback((item: string) => {
-    setDone((prev) => {
-      const next = { ...prev, [item]: !prev[item] };
+    let cancelled = false;
+    (async () => {
       try {
-        localStorage.setItem(GROCERY_DONE_KEY, JSON.stringify(next));
+        const raw = await storageGet(GROCERY_DONE_KEY);
+        if (!cancelled && raw) setDone(JSON.parse(raw));
       } catch {
         /* ignore */
       }
-      return next;
-    });
+      if (!cancelled) setHydrated(true);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!hydrated) return;
+    storageSet(GROCERY_DONE_KEY, JSON.stringify(done)).catch(() => {});
+  }, [done, hydrated]);
+
+  const toggle = useCallback((item: string) => {
+    setDone((prev) => ({ ...prev, [item]: !prev[item] }));
   }, []);
 
   const resetAll = useCallback(() => {
     setDone({});
-    try {
-      localStorage.removeItem(GROCERY_DONE_KEY);
-    } catch {
-      /* ignore */
-    }
   }, []);
 
   return { done, toggle, resetAll };
@@ -332,6 +494,18 @@ type GeneratedPlan = {
   adjustment: string; days: Record<string, GeneratedPlanDay>;
 };
 
+type GeneratedPrepSession = { key: string; label: string; tasks: string[] };
+
+type GeneratedPrepPlan = {
+  weekStart: string;
+  generatedAt: string;
+  calorieTarget: number;
+  proteinTarget: number;
+  goalLabel: string;
+  sessions: GeneratedPrepSession[];
+  notes?: string;
+};
+
 type FoodResult = {
   product_name: string;
   brands: string;
@@ -349,40 +523,37 @@ type FoodResult = {
 
 const useWeightData = () => {
   const [weights, setWeights] = useState<WeightEntry[]>([]);
+  const [hydrated, setHydrated] = useState(false);
 
   useEffect(() => {
-    try {
-      const raw = localStorage.getItem(WEIGHT_STORAGE_KEY);
-      if (raw) setWeights(JSON.parse(raw) as WeightEntry[]);
-    } catch {
-      /* vide ou JSON invalide */
-    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const raw = await storageGet(WEIGHT_STORAGE_KEY);
+        if (!cancelled && raw) setWeights(JSON.parse(raw) as WeightEntry[]);
+      } catch {
+        /* vide ou JSON invalide */
+      }
+      if (!cancelled) setHydrated(true);
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
+  useEffect(() => {
+    if (!hydrated) return;
+    storageSet(WEIGHT_STORAGE_KEY, JSON.stringify(weights)).catch(() => {});
+  }, [weights, hydrated]);
+
   const addWeight = useCallback((date: string, kg: string) => {
-    setWeights((prev: WeightEntry[]) => {
-      const updated = [...prev.filter((w: WeightEntry) => w.date !== date), { date, kg: parseFloat(kg) }].sort(
-        (a, b) => a.date.localeCompare(b.date)
-      );
-      try {
-        localStorage.setItem(WEIGHT_STORAGE_KEY, JSON.stringify(updated));
-      } catch {
-        /* quota ou mode privé */
-      }
-      return updated;
-    });
+    setWeights((prev: WeightEntry[]) =>
+      [...prev.filter((w: WeightEntry) => w.date !== date), { date, kg: parseFloat(kg) }].sort((a, b) => a.date.localeCompare(b.date))
+    );
   }, []);
 
   const removeWeight = useCallback((date: string) => {
-    setWeights((prev: WeightEntry[]) => {
-      const updated = prev.filter((w: WeightEntry) => w.date !== date);
-      try {
-        localStorage.setItem(WEIGHT_STORAGE_KEY, JSON.stringify(updated));
-      } catch {
-        /* quota */
-      }
-      return updated;
-    });
+    setWeights((prev: WeightEntry[]) => prev.filter((w: WeightEntry) => w.date !== date));
   }, []);
 
   return { weights, addWeight, removeWeight };
@@ -496,7 +667,8 @@ const MacroBar = ({
 
 // --- MAIN APP ---
 
-export default function App() {
+export default function App(props: { currentUser?: AppUser; onLogout?: () => void } = {}) {
+  const { currentUser, onLogout } = props;
   const [activeTab, setActiveTab] = usePersistedState<string>("muscu-tab", "planning");
   const [selectedDay, setSelectedDay] = usePersistedState<string>("muscu-day", getTodayFrDay());
   const [expandedMeal, setExpandedMeal] = useState<string | null>(null);
@@ -506,6 +678,18 @@ export default function App() {
   const [newDate, setNewDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [newKg, setNewKg] = useState("");
   const [weightFormError, setWeightFormError] = useState<string | null>(null);
+  const [profileMenuOpen, setProfileMenuOpen] = useState(false);
+  const [profileModalOpen, setProfileModalOpen] = useState(false);
+  const profileMenuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!profileMenuOpen) return;
+    const fn = (e: MouseEvent) => {
+      if (profileMenuRef.current && !profileMenuRef.current.contains(e.target as Node)) setProfileMenuOpen(false);
+    };
+    document.addEventListener("mousedown", fn);
+    return () => document.removeEventListener("mousedown", fn);
+  }, [profileMenuOpen]);
 
   // Timer
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -529,14 +713,26 @@ export default function App() {
   const [foodFavorites, setFoodFavorites] = usePersistedState<FoodResult[]>("muscu-food-favorites", []);
   const [recentSearches, setRecentSearches] = usePersistedState<string[]>("muscu-food-recent", []);
 
-  // Weekly AI plan
-  const [apiKey, setApiKey] = usePersistedState<string>("muscu-api-key", "");
+  const [userProfile, setUserProfile] = usePersistedState<UserProfile>("muscu-profile", {
+    heightCm: 180,
+    goal: "bulk",
+    age: 28,
+  });
+
+  // Weekly AI plan (Gemini — quota gratuit via Google AI Studio)
+  const [apiKey, setApiKey] = usePersistedState<string>("muscu-gemini-api-key", "");
   const [apiKeyInput, setApiKeyInput] = useState("");
   const [generatedPlans, setGeneratedPlans] = usePersistedState<GeneratedPlan[]>("muscu-weekly-plans", []);
+  const [selectedPlanIndex, setSelectedPlanIndex] = useState(0);
   const [planGenerating, setPlanGenerating] = useState(false);
   const [planError, setPlanError] = useState<string | null>(null);
   const [expandedPlanDay, setExpandedPlanDay] = useState<string | null>(null);
   const autoGenDoneRef = useRef(false);
+
+  const [prepPlans, setPrepPlans] = usePersistedState<GeneratedPrepPlan[]>("muscu-prep-plans", []);
+  const [selectedPrepIndex, setSelectedPrepIndex] = useState(0);
+  const [prepGenerating, setPrepGenerating] = useState(false);
+  const [prepError, setPrepError] = useState<string | null>(null);
 
   // Edit saved set
   const [editingSet, setEditingSet] = useState<{ exercise: string; date: string; idx: number } | null>(null);
@@ -545,7 +741,9 @@ export default function App() {
 
   const latestWeight = weights.length > 0 ? weights[weights.length - 1] : null;
   const groceryChecked = GROCERIES.filter((g) => groceryDone[g.item]).length;
-  const imc = latestWeight ? latestWeight.kg / (1.8 * 1.8) : null;
+  const heightM = userProfile.heightCm / 100;
+  const imc = latestWeight && heightM > 0 ? latestWeight.kg / (heightM * heightM) : null;
+  const groceryEstimate = estimateGroceryTotal();
   const todayStr = new Date().toISOString().slice(0, 10);
 
   const tabs = [
@@ -579,7 +777,7 @@ export default function App() {
   };
 
   const weeklyGain = computeWeeklyGain(weights);
-  const targetData = computeTarget(weeklyGain, latestWeight?.kg ?? null);
+  const targetData = computeTarget(weeklyGain, latestWeight?.kg ?? null, userProfile);
 
   const generateWeeklyPlan = async (weekStart?: string) => {
     if (!apiKey) return;
@@ -594,9 +792,10 @@ export default function App() {
       ? `+${(weights[weights.length - 1].kg - weights[0].kg).toFixed(1)}kg depuis le début`
       : "départ non enregistré";
 
-    const prompt = `Tu es un expert en nutrition sportive pour la prise de masse.
+    const goalFr = userProfile.goal === "cut" ? "sèche (déficit calorique, protéines élevées)" : "prise de masse propre (surplus modéré)";
+    const prompt = `Tu es un expert en nutrition sportive.
 
-Profil athlète: Ectomorphe, ${latestWeight?.kg ?? 60}kg, 1.80m, objectif prise de masse propre
+Profil athlète: ${latestWeight?.kg ?? 70} kg, ${userProfile.heightCm} cm, ${userProfile.age} ans, objectif: ${goalFr}
 Semaine à planifier: du ${wStart}
 Historique poids: ${weightHistory}
 Bilan: ${totalGain}
@@ -606,7 +805,8 @@ Raison: ${targetData.reason}
 
 Génère un plan repas complet pour 7 jours (Lundi à Dimanche).
 Contraintes: aliments simples et économiques uniquement (poulet, riz, pâtes, œufs, thon, saumon, steak haché 5%, skyr, flocons d'avoine, légumes, fruits).
-Varie les protéines d'un jour à l'autre. Adapte les portions pour atteindre la cible calorique.
+${userProfile.goal === "cut" ? "Privilégie satiété et protéines ; glucides modérés autour de l'entraînement." : "Varie les protéines d'un jour à l'autre."}
+Varie les repas d'un jour à l'autre et adapte les portions pour atteindre la cible calorique.
 
 Retourne UNIQUEMENT un JSON valide sans texte autour:
 {
@@ -630,13 +830,7 @@ Retourne UNIQUEMENT un JSON valide sans texte autour:
 }`;
 
     try {
-      const client = new Anthropic({ apiKey, dangerouslyAllowBrowser: true });
-      const msg = await client.messages.create({
-        model: "claude-haiku-4-5-20251001",
-        max_tokens: 4096,
-        messages: [{ role: "user", content: prompt }],
-      });
-      const text = msg.content[0].type === "text" ? msg.content[0].text : "";
+      const text = await geminiGenerateText(apiKey, prompt);
       const jsonMatch = text.match(/\{[\s\S]*\}/);
       if (!jsonMatch) throw new Error("Réponse invalide du modèle");
       const parsed = JSON.parse(jsonMatch[0]);
@@ -648,12 +842,145 @@ Retourne UNIQUEMENT un JSON valide sans texte autour:
         adjustment: parsed.adjustment ?? targetData.reason,
         days: { Lundi: parsed.Lundi, Mardi: parsed.Mardi, Mercredi: parsed.Mercredi, Jeudi: parsed.Jeudi, Vendredi: parsed.Vendredi, Samedi: parsed.Samedi, Dimanche: parsed.Dimanche },
       };
-      setGeneratedPlans(prev => [plan, ...prev.filter(p => p.weekStart !== wStart)].slice(0, 12));
+      setGeneratedPlans((prev) => [plan, ...prev.filter((p) => p.weekStart !== wStart)].slice(0, 104));
+      setSelectedPlanIndex(0);
     } catch (e: any) {
       setPlanError(e?.message ?? "Erreur inconnue");
     }
     setPlanGenerating(false);
   };
+
+  const generatePrepWeeklyPlan = async (weekStart?: string) => {
+    if (!apiKey) return;
+    const wStart = weekStart ?? getNextMonday();
+    setPrepGenerating(true);
+    setPrepError(null);
+
+    const goalFr = userProfile.goal === "cut" ? "sèche" : "prise de masse";
+    const latestWeekPlan = generatedPlans.find((p) => p.weekStart === wStart) ?? generatedPlans[0];
+    const weekMealsContext = latestWeekPlan
+      ? JSON.stringify(latestWeekPlan.days).slice(0, 8000)
+      : "Aucun plan hebdo JSON encore — base-toi sur les cibles macros uniquement.";
+
+    const prompt = `Tu es coach en meal prep (batch cooking) pour sportif.
+
+Profil: ${latestWeight?.kg ?? 70} kg, ${userProfile.heightCm} cm, ${userProfile.age} ans, objectif ${goalFr}.
+Cibles nutrition: ${targetData.kcal} kcal/jour, ${targetData.protein} g protéines/jour.
+Semaine à couvrir: à partir du ${wStart}.
+
+Plan repas 7 jours (référence, peut être incomplet):
+${weekMealsContext}
+
+Tâche: génère un plan de préparation culinaire sur la semaine (sessions de batch type "Lundi soir", "Mercredi soir", "Dimanche") avec quantités en grammes cuits, cuissons, sauces, œufs durs, portionnement. Les tâches doivent être actionnables en cuisine.
+
+Retourne UNIQUEMENT un JSON valide sans markdown:
+{
+  "notes": "une phrase optionnelle",
+  "sessions": [
+    { "key": "Lundi soir", "label": "Titre court", "tasks": ["tâche 1", "tâche 2"] }
+  ]
+}
+Minimum 3 sessions, maximum 5. Clés "key" en français (ex: Lundi soir, Mercredi, Dimanche).`;
+
+    try {
+      const text = await geminiGenerateText(apiKey, prompt);
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) throw new Error("Réponse invalide du modèle");
+      const parsed = JSON.parse(jsonMatch[0]);
+      const sessions = (parsed.sessions || []) as GeneratedPrepSession[];
+      if (!Array.isArray(sessions) || sessions.length === 0) throw new Error("Aucune session de prep dans la réponse");
+      const newPrep: GeneratedPrepPlan = {
+        weekStart: wStart,
+        generatedAt: new Date().toISOString(),
+        calorieTarget: targetData.kcal,
+        proteinTarget: targetData.protein,
+        goalLabel: goalFr,
+        sessions,
+        notes: typeof parsed.notes === "string" ? parsed.notes : undefined,
+      };
+      setPrepPlans((prev) => [newPrep, ...prev.filter((p) => p.weekStart !== wStart)].slice(0, 104));
+      setSelectedPrepIndex(0);
+    } catch (e: any) {
+      setPrepError(e?.message ?? "Erreur inconnue");
+    }
+    setPrepGenerating(false);
+  };
+
+  const removeWeeklyPlanAt = useCallback(
+    (index: number) => {
+      setGeneratedPlans((prev) => {
+        const next = prev.filter((_, i) => i !== index);
+        setSelectedPlanIndex((sel) => {
+          if (next.length === 0) return 0;
+          if (index < sel) return sel - 1;
+          if (index === sel) return Math.min(sel, next.length - 1);
+          return sel;
+        });
+        setExpandedPlanDay(null);
+        return next;
+      });
+    },
+    [setGeneratedPlans]
+  );
+
+  const removePrepPlanAt = useCallback(
+    (index: number) => {
+      setPrepPlans((prev) => {
+        const next = prev.filter((_, i) => i !== index);
+        setSelectedPrepIndex((sel) => {
+          if (next.length === 0) return 0;
+          if (index < sel) return sel - 1;
+          if (index === sel) return Math.min(sel, next.length - 1);
+          return sel;
+        });
+        return next;
+      });
+    },
+    [setPrepPlans]
+  );
+
+  // Migration ancienne clé (Anthropic) → Gemini si encore présente
+  useEffect(() => {
+    try {
+      const oldRaw = localStorage.getItem("muscu-api-key");
+      if (!oldRaw) return;
+      const parsed = JSON.parse(oldRaw);
+      if (typeof parsed === "string" && parsed.length > 0) {
+        setApiKey((prev) => prev || parsed);
+        localStorage.removeItem("muscu-api-key");
+      }
+    } catch {
+      /* ignore */
+    }
+  }, [setApiKey]);
+
+  // Migration ancien prep unique → liste
+  useEffect(() => {
+    try {
+      if (prepPlans.length > 0) return;
+      const raw = localStorage.getItem("muscu-prep-ai");
+      if (!raw) return;
+      const p = JSON.parse(raw);
+      if (p?.weekStart && Array.isArray(p.sessions)) {
+        setPrepPlans([p]);
+        localStorage.removeItem("muscu-prep-ai");
+      }
+    } catch {
+      /* ignore */
+    }
+  }, [prepPlans.length, setPrepPlans]);
+
+  useEffect(() => {
+    if (selectedPlanIndex >= generatedPlans.length && generatedPlans.length > 0) {
+      setSelectedPlanIndex(generatedPlans.length - 1);
+    }
+  }, [generatedPlans.length, selectedPlanIndex]);
+
+  useEffect(() => {
+    if (selectedPrepIndex >= prepPlans.length && prepPlans.length > 0) {
+      setSelectedPrepIndex(prepPlans.length - 1);
+    }
+  }, [prepPlans.length, selectedPrepIndex]);
 
   // Auto-generate every Saturday for the coming week
   useEffect(() => {
@@ -861,34 +1188,128 @@ Retourne UNIQUEMENT un JSON valide sans texte autour:
           paddingRight: "var(--layout-pad-x)",
         }}
       >
-        <div style={{ display: "flex", alignItems: "flex-end", gap: 10 }}>
-          <h1
-            style={{
-              fontFamily: "var(--font-display)",
-              fontSize: "clamp(1.9rem, 6.5vw, 3.4rem)",
-              fontWeight: 900,
-              color: "var(--text)",
-              letterSpacing: "-0.02em",
-              lineHeight: 1,
-              margin: 0,
-              textTransform: "uppercase",
-            }}
-          >
-            MASS PROTOCOL
-          </h1>
-          <span
-            style={{
-              fontFamily: "var(--font-mono)",
-              fontSize: 9,
-              color: "var(--accent)",
-              letterSpacing: "0.15em",
-              textTransform: "uppercase",
-              paddingBottom: 5,
-              fontWeight: 500,
-            }}
-          >
-            V1.0
-          </span>
+        <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", gap: 12, flexWrap: "wrap", width: "100%" }}>
+          <div style={{ display: "flex", alignItems: "flex-end", gap: 10 }}>
+            <h1
+              style={{
+                fontFamily: "var(--font-display)",
+                fontSize: "clamp(1.9rem, 6.5vw, 3.4rem)",
+                fontWeight: 900,
+                color: "var(--text)",
+                letterSpacing: "-0.02em",
+                lineHeight: 1,
+                margin: 0,
+                textTransform: "uppercase",
+              }}
+            >
+              MASS PROTOCOL
+            </h1>
+            <span
+              style={{
+                fontFamily: "var(--font-mono)",
+                fontSize: 9,
+                color: "var(--accent)",
+                letterSpacing: "0.15em",
+                textTransform: "uppercase",
+                paddingBottom: 5,
+                fontWeight: 500,
+              }}
+            >
+              V1.0
+            </span>
+          </div>
+          {currentUser && onLogout ? (
+            <div ref={profileMenuRef} style={{ position: "relative", paddingBottom: 2, flexShrink: 0 }}>
+              <button
+                type="button"
+                aria-expanded={profileMenuOpen}
+                aria-haspopup="menu"
+                onClick={() => setProfileMenuOpen((o) => !o)}
+                title={currentUser.displayName || currentUser.username}
+                style={{
+                  width: 40,
+                  height: 40,
+                  borderRadius: "50%",
+                  border: "2px solid rgba(190,255,0,0.35)",
+                  background: "linear-gradient(145deg, #2a2a38, #17172A)",
+                  color: "var(--accent)",
+                  fontFamily: "var(--font-display)",
+                  fontSize: 14,
+                  fontWeight: 800,
+                  cursor: "pointer",
+                  padding: 0,
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  letterSpacing: "-0.02em",
+                }}
+              >
+                {getUserInitials(currentUser)}
+              </button>
+              {profileMenuOpen ? (
+                <div
+                  role="menu"
+                  style={{
+                    position: "absolute",
+                    top: "calc(100% + 8px)",
+                    right: 0,
+                    minWidth: 180,
+                    background: "var(--bg-raised)",
+                    border: "1px solid var(--border)",
+                    borderRadius: 4,
+                    boxShadow: "0 12px 40px rgba(0,0,0,0.45)",
+                    padding: "6px 0",
+                    zIndex: 100,
+                  }}
+                >
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => {
+                      setProfileMenuOpen(false);
+                      setProfileModalOpen(true);
+                    }}
+                    style={{
+                      display: "block",
+                      width: "100%",
+                      textAlign: "left",
+                      padding: "10px 14px",
+                      border: "none",
+                      background: "transparent",
+                      color: "var(--text)",
+                      fontFamily: "var(--font-body)",
+                      fontSize: 13,
+                      cursor: "pointer",
+                    }}
+                  >
+                    Profil
+                  </button>
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => {
+                      setProfileMenuOpen(false);
+                      void onLogout();
+                    }}
+                    style={{
+                      display: "block",
+                      width: "100%",
+                      textAlign: "left",
+                      padding: "10px 14px",
+                      border: "none",
+                      background: "transparent",
+                      color: "var(--accent3)",
+                      fontFamily: "var(--font-body)",
+                      fontSize: 13,
+                      cursor: "pointer",
+                    }}
+                  >
+                    Déconnexion
+                  </button>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
         </div>
         <p
           style={{
@@ -904,6 +1325,69 @@ Retourne UNIQUEMENT un JSON valide sans texte autour:
         </p>
       </header>
 
+      {profileModalOpen && currentUser ? (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="profile-modal-title"
+          style={{
+            position: "fixed",
+            inset: 0,
+            zIndex: 9999,
+            background: "rgba(0,0,0,0.65)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: 24,
+          }}
+          onClick={() => setProfileModalOpen(false)}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              background: "var(--bg-raised)",
+              border: "1px solid var(--border)",
+              borderRadius: 4,
+              padding: 24,
+              maxWidth: 380,
+              width: "100%",
+              boxShadow: "0 8px 40px rgba(0,0,0,0.5)",
+            }}
+          >
+            <h2 id="profile-modal-title" style={{ margin: "0 0 18px", fontFamily: "var(--font-display)", fontSize: 22, fontWeight: 800 }}>
+              Profil
+            </h2>
+            <p style={{ margin: "0 0 6px", fontSize: 11, color: "var(--dim)", fontFamily: "var(--font-mono)", textTransform: "uppercase", letterSpacing: "0.08em" }}>
+              Nom affiché
+            </p>
+            <p style={{ margin: "0 0 16px", fontSize: 15 }}>{currentUser.displayName || currentUser.username}</p>
+            <p style={{ margin: "0 0 6px", fontSize: 11, color: "var(--dim)", fontFamily: "var(--font-mono)", textTransform: "uppercase", letterSpacing: "0.08em" }}>
+              Identifiant
+            </p>
+            <p style={{ margin: "0 0 22px", fontSize: 15 }}>{currentUser.username}</p>
+            <button
+              type="button"
+              onClick={() => setProfileModalOpen(false)}
+              style={{
+                padding: "10px 18px",
+                fontSize: 12,
+                fontFamily: "var(--font-mono)",
+                textTransform: "uppercase",
+                letterSpacing: "0.06em",
+                background: "var(--bg-dim)",
+                border: "1px solid var(--border)",
+                color: "var(--text)",
+                cursor: "pointer",
+                borderRadius: 2,
+                fontWeight: 600,
+              }}
+            >
+              Fermer
+            </button>
+          </div>
+        </div>
+      ) : null}
+
       <div className="app-layout">
         <aside className="app-layout-sidebar" aria-label="Indicateurs">
           <div className="app-stats-grid">
@@ -914,7 +1398,13 @@ Retourne UNIQUEMENT un JSON valide sans texte autour:
               color="#BEFF00"
               hint={latestWeight ? `Pesée : ${formatFrDate(latestWeight.date)}` : "Ajoute une pesée → Suivi"}
             />
-            <StatCard label="Taille" value="1.80" unit="m" color="#4DAAFF" hint="Référence" />
+            <StatCard
+              label="Taille"
+              value={(userProfile.heightCm / 100).toFixed(2)}
+              unit="m"
+              color="#4DAAFF"
+              hint="Réglage onglet Hebdo"
+            />
             <StatCard
               label="IMC"
               value={imc ? imc.toFixed(1) : "—"}
@@ -922,8 +1412,14 @@ Retourne UNIQUEMENT un JSON valide sans texte autour:
               color="#FF7033"
               hint={imc ? (imc < 18.5 ? "Sous-poids" : imc < 25 ? "Normal" : "Surpoids") : "Ajoute une pesée"}
             />
-            <StatCard label="Objectif" value="~2400" unit="kcal/j" color="#FF3B5C" />
-            <StatCard label="Protéines" value="~180" unit="g/j" color="#A07AF5" />
+            <StatCard
+              label="Objectif"
+              value={`~${targetData.kcal}`}
+              unit="kcal/j"
+              color="#FF3B5C"
+              hint={userProfile.goal === "cut" ? "Sèche" : "Prise de masse"}
+            />
+            <StatCard label="Protéines" value={`~${targetData.protein}`} unit="g/j" color="#A07AF5" />
           </div>
         </aside>
 
@@ -1101,6 +1597,343 @@ Retourne UNIQUEMENT un JSON valide sans texte autour:
                   </div>
                 ))}
               </div>
+            </div>
+          )}
+
+          {/* ============ HEBDO (IA) TAB ============ */}
+          {activeTab === "hebdo" && (
+            <div>
+              <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: "clamp(12px, 3vw, 18px)" }}>
+                <div style={{ width: 3, height: 22, background: "var(--accent)", flexShrink: 0 }} />
+                <h2
+                  className="app-section-title"
+                  style={{
+                    fontFamily: "var(--font-display)",
+                    fontWeight: 900,
+                    margin: 0,
+                    textTransform: "uppercase",
+                    letterSpacing: "-0.01em",
+                  }}
+                >
+                  Plan hebdo IA
+                </h2>
+              </div>
+
+              <div
+                className="app-card-pad"
+                style={{
+                  background: "var(--bg-card)",
+                  borderRadius: 4,
+                  marginBottom: 16,
+                  border: "1px solid var(--border)",
+                }}
+              >
+                <p style={{ fontSize: 12, color: "var(--dim)", margin: "0 0 14px", lineHeight: 1.55, fontFamily: "var(--font-body)" }}>
+                  Profil utilisé pour le TDEE (Mifflin–St Jeor) et les cibles. IA via{" "}
+                  <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener noreferrer" style={{ color: "var(--accent2)" }}>
+                    Google AI Studio
+                  </a>{" "}
+                  (quota gratuit, clé stockée localement sur cet appareil).
+                </p>
+                <div style={{ display: "grid", gap: 12, gridTemplateColumns: "repeat(auto-fill, minmax(140px, 1fr))" }}>
+                  <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                    <span style={{ fontSize: 9, color: "var(--dim)", fontFamily: "var(--font-mono)", textTransform: "uppercase", letterSpacing: "0.08em" }}>Taille (cm)</span>
+                    <input
+                      type="number"
+                      min={140}
+                      max={220}
+                      value={userProfile.heightCm}
+                      onChange={(e) => setUserProfile((p) => ({ ...p, heightCm: Math.min(220, Math.max(140, parseInt(e.target.value, 10) || 170)) }))}
+                      style={{
+                        background: "var(--bg-raised)",
+                        border: "1px solid var(--border)",
+                        color: "var(--text)",
+                        padding: "8px 10px",
+                        fontFamily: "var(--font-mono)",
+                        fontSize: 13,
+                        borderRadius: 2,
+                      }}
+                    />
+                  </label>
+                  <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                    <span style={{ fontSize: 9, color: "var(--dim)", fontFamily: "var(--font-mono)", textTransform: "uppercase", letterSpacing: "0.08em" }}>Âge</span>
+                    <input
+                      type="number"
+                      min={16}
+                      max={80}
+                      value={userProfile.age}
+                      onChange={(e) => setUserProfile((p) => ({ ...p, age: Math.min(80, Math.max(16, parseInt(e.target.value, 10) || 25)) }))}
+                      style={{
+                        background: "var(--bg-raised)",
+                        border: "1px solid var(--border)",
+                        color: "var(--text)",
+                        padding: "8px 10px",
+                        fontFamily: "var(--font-mono)",
+                        fontSize: 13,
+                        borderRadius: 2,
+                      }}
+                    />
+                  </label>
+                  <label style={{ display: "flex", flexDirection: "column", gap: 4, gridColumn: "1 / -1" }}>
+                    <span style={{ fontSize: 9, color: "var(--dim)", fontFamily: "var(--font-mono)", textTransform: "uppercase", letterSpacing: "0.08em" }}>Objectif</span>
+                    <select
+                      value={userProfile.goal}
+                      onChange={(e) => setUserProfile((p) => ({ ...p, goal: e.target.value as NutritionGoal }))}
+                      style={{
+                        background: "var(--bg-raised)",
+                        border: "1px solid var(--border)",
+                        color: "var(--text)",
+                        padding: "8px 10px",
+                        fontFamily: "var(--font-body)",
+                        fontSize: 13,
+                        borderRadius: 2,
+                        maxWidth: 280,
+                      }}
+                    >
+                      <option value="bulk">Prise de masse</option>
+                      <option value="cut">Sèche</option>
+                    </select>
+                  </label>
+                </div>
+                <div style={{ marginTop: 14 }}>
+                  <span style={{ fontSize: 9, color: "var(--dim)", fontFamily: "var(--font-mono)", textTransform: "uppercase", letterSpacing: "0.08em" }}>Clé API Google (Gemini)</span>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 6, alignItems: "center" }}>
+                    <input
+                      type="password"
+                      autoComplete="off"
+                      placeholder="AIza..."
+                      value={apiKeyInput || apiKey}
+                      onChange={(e) => setApiKeyInput(e.target.value)}
+                      style={{
+                        flex: "1 1 200px",
+                        minWidth: 0,
+                        background: "var(--bg-raised)",
+                        border: "1px solid var(--border)",
+                        color: "var(--text)",
+                        padding: "8px 10px",
+                        fontFamily: "var(--font-mono)",
+                        fontSize: 11,
+                        borderRadius: 2,
+                      }}
+                    />
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setApiKey(apiKeyInput.trim());
+                        setApiKeyInput("");
+                      }}
+                      style={{
+                        padding: "8px 14px",
+                        borderRadius: 2,
+                        border: "none",
+                        background: "var(--accent)",
+                        color: "#0A0A0E",
+                        fontWeight: 800,
+                        fontFamily: "var(--font-mono)",
+                        fontSize: 10,
+                        cursor: "pointer",
+                        textTransform: "uppercase",
+                        letterSpacing: "0.06em",
+                      }}
+                    >
+                      Enregistrer
+                    </button>
+                  </div>
+                </div>
+                <div
+                  style={{
+                    marginTop: 14,
+                    padding: "10px 12px",
+                    background: "rgba(190,255,0,0.06)",
+                    border: "1px solid rgba(190,255,0,0.12)",
+                    borderRadius: 2,
+                    fontSize: 11,
+                    fontFamily: "var(--font-mono)",
+                    color: "var(--accent)",
+                    lineHeight: 1.5,
+                  }}
+                >
+                  Cible actuelle: {targetData.kcal} kcal/j · {targetData.protein} g prot/j — {targetData.reason}
+                </div>
+                <button
+                  type="button"
+                  disabled={!apiKey || planGenerating}
+                  onClick={() => generateWeeklyPlan()}
+                  style={{
+                    marginTop: 14,
+                    padding: "12px 18px",
+                    borderRadius: 2,
+                    border: "none",
+                    background: apiKey && !planGenerating ? "var(--accent2)" : "var(--border)",
+                    color: apiKey && !planGenerating ? "#0A0A0E" : "var(--dim)",
+                    fontWeight: 800,
+                    fontFamily: "var(--font-display)",
+                    fontSize: 13,
+                    cursor: apiKey && !planGenerating ? "pointer" : "not-allowed",
+                    textTransform: "uppercase",
+                    letterSpacing: "0.04em",
+                    width: "100%",
+                  }}
+                >
+                  {planGenerating ? "Génération…" : "Générer le plan repas 7 jours"}
+                </button>
+                {planError ? (
+                  <p style={{ color: "#FF3B5C", fontSize: 12, marginTop: 10, fontFamily: "var(--font-mono)" }}>{planError}</p>
+                ) : null}
+              </div>
+
+              {generatedPlans.length > 0 ? (
+                <div>
+                  <h3
+                    style={{
+                      fontFamily: "var(--font-display)",
+                      fontSize: "clamp(15px, 3.5vw, 18px)",
+                      fontWeight: 800,
+                      margin: "0 0 8px",
+                      textTransform: "uppercase",
+                      letterSpacing: "0.02em",
+                    }}
+                  >
+                    Historique des semaines ({generatedPlans.length})
+                  </h3>
+                  <p style={{ fontSize: 11, color: "var(--dim)", margin: "0 0 12px", lineHeight: 1.5 }}>
+                    Chaque nouvelle génération est ajoutée ; les semaines précédentes restent consultables (jusqu’à ~2 ans stockées localement).
+                  </p>
+                  {generatedPlans.length > 1 ? (
+                    <label style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 14 }}>
+                      <span style={{ fontSize: 9, color: "var(--dim)", fontFamily: "var(--font-mono)", textTransform: "uppercase", letterSpacing: "0.08em" }}>
+                        Voir une semaine
+                      </span>
+                      <select
+                        value={Math.min(selectedPlanIndex, generatedPlans.length - 1)}
+                        onChange={(e) => {
+                          setSelectedPlanIndex(Number(e.target.value));
+                          setExpandedPlanDay(null);
+                        }}
+                        style={{
+                          background: "var(--bg-raised)",
+                          border: "1px solid var(--border)",
+                          color: "var(--text)",
+                          padding: "10px 12px",
+                          fontFamily: "var(--font-body)",
+                          fontSize: 13,
+                          borderRadius: 2,
+                          maxWidth: "100%",
+                        }}
+                      >
+                        {generatedPlans.map((p, i) => (
+                          <option key={p.weekStart + p.generatedAt} value={i}>
+                            Semaine du {formatFrDate(p.weekStart)} — créé le {formatFrDate(p.generatedAt.slice(0, 10))}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  ) : null}
+                  {(() => {
+                    const planIdx = Math.min(selectedPlanIndex, generatedPlans.length - 1);
+                    const plan = generatedPlans[planIdx];
+                    if (!plan) return null;
+                    return (
+                      <div
+                        key={plan.weekStart + plan.generatedAt}
+                        className="app-card-pad"
+                        style={{
+                          background: "var(--bg-card)",
+                          borderRadius: 4,
+                          marginBottom: 12,
+                          border: "1px solid var(--border)",
+                          borderLeft: "2px solid var(--accent2)",
+                        }}
+                      >
+                        <div
+                          style={{
+                            display: "flex",
+                            flexWrap: "wrap",
+                            alignItems: "flex-start",
+                            justifyContent: "space-between",
+                            gap: 10,
+                            marginBottom: 8,
+                          }}
+                        >
+                          <div style={{ fontSize: 10, color: "var(--dim)", fontFamily: "var(--font-mono)", flex: "1 1 200px" }}>
+                            Semaine du {formatFrDate(plan.weekStart)} · généré {formatFrDate(plan.generatedAt.slice(0, 10))}
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (window.confirm("Supprimer cette génération de l’historique ?")) removeWeeklyPlanAt(planIdx);
+                            }}
+                            style={{
+                              flexShrink: 0,
+                              padding: "6px 12px",
+                              fontSize: 10,
+                              fontFamily: "var(--font-mono)",
+                              textTransform: "uppercase",
+                              letterSpacing: "0.06em",
+                              background: "rgba(255,59,92,0.08)",
+                              border: "1px solid rgba(255,59,92,0.35)",
+                              color: "#FF3B5C",
+                              cursor: "pointer",
+                              borderRadius: 2,
+                              fontWeight: 600,
+                            }}
+                          >
+                            Supprimer
+                          </button>
+                        </div>
+                        <div style={{ fontSize: 11, color: "var(--accent)", fontFamily: "var(--font-mono)", marginBottom: 12 }}>
+                          {plan.calorieTarget} kcal · {plan.proteinTarget} g prot — {plan.adjustment}
+                        </div>
+                        {DAYS.map((day) => {
+                          const dayPlan = plan.days[day];
+                          if (!dayPlan) return null;
+                          const open = expandedPlanDay === `${plan.weekStart}-${day}`;
+                          return (
+                            <button
+                              key={day}
+                              type="button"
+                              onClick={() => setExpandedPlanDay(open ? null : `${plan.weekStart}-${day}`)}
+                              style={{
+                                width: "100%",
+                                textAlign: "left",
+                                background: open ? "rgba(77,170,255,0.06)" : "var(--bg-raised)",
+                                borderRadius: 2,
+                                padding: "10px 12px",
+                                marginBottom: 6,
+                                border: open ? "1px solid rgba(77,170,255,0.25)" : "1px solid var(--border)",
+                                color: "inherit",
+                                font: "inherit",
+                                cursor: "pointer",
+                              }}
+                            >
+                              <div style={{ fontFamily: "var(--font-display)", fontWeight: 800, fontSize: 13, textTransform: "uppercase" }}>
+                                {day} · {dayPlan.total?.kcal ?? "?"} kcal
+                              </div>
+                              {open ? (
+                                <div style={{ marginTop: 10, fontSize: 12, lineHeight: 1.6 }}>
+                                  {Object.entries(MEAL_LABELS).map(([k, meta]) => {
+                                    const m = dayPlan[k as keyof GeneratedPlanDay];
+                                    if (!m || typeof m !== "object" || !("name" in m)) return null;
+                                    return (
+                                      <div key={k} style={{ marginBottom: 8, paddingBottom: 8, borderBottom: "1px solid var(--border)" }}>
+                                        <span style={{ color: "var(--accent2)", fontFamily: "var(--font-mono)", fontSize: 9 }}>{meta.label}</span>
+                                        <div style={{ fontWeight: 700 }}>{m.name}</div>
+                                        <div style={{ color: "var(--dim)", fontSize: 11 }}>{m.detail}</div>
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              ) : null}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    );
+                  })()}
+                </div>
+              ) : (
+                <p style={{ fontSize: 12, color: "var(--dim)", fontFamily: "var(--font-mono)" }}>Aucun plan généré pour l’instant.</p>
+              )}
             </div>
           )}
 
@@ -1613,6 +2446,191 @@ Retourne UNIQUEMENT un JSON valide sans texte autour:
                   Meal Prep & Courses
                 </h2>
               </div>
+
+              <div
+                className="app-card-pad"
+                style={{
+                  background: "var(--bg-card)",
+                  borderRadius: 4,
+                  marginBottom: 16,
+                  border: "1px solid var(--border)",
+                  borderLeft: "2px solid #4DAAFF",
+                }}
+              >
+                <h3
+                  style={{
+                    fontFamily: "var(--font-display)",
+                    fontSize: 14,
+                    fontWeight: 800,
+                    margin: "0 0 8px",
+                    color: "#4DAAFF",
+                    textTransform: "uppercase",
+                  }}
+                >
+                  Estimation budget courses
+                </h3>
+                <p style={{ fontSize: 11, color: "var(--dim)", margin: "0 0 10px", lineHeight: 1.55, fontFamily: "var(--font-mono)" }}>
+                  Aucune API publique ne donne les prix réels des magasins en France. Ici: grille indicative (€) pour les quantités de la liste ci-dessous, type grande surface.
+                </p>
+                <div style={{ fontFamily: "var(--font-display)", fontSize: "clamp(1.5rem, 5vw, 2rem)", fontWeight: 900, color: "var(--accent)" }}>
+                  ~{groceryEstimate.total.toFixed(0)} €
+                  <span style={{ fontSize: 11, fontWeight: 600, color: "var(--dim)", marginLeft: 8, fontFamily: "var(--font-mono)" }}>pour la liste type</span>
+                </div>
+              </div>
+
+              <div
+                className="app-card-pad"
+                style={{
+                  background: "var(--bg-card)",
+                  borderRadius: 4,
+                  marginBottom: 18,
+                  border: "1px solid var(--border)",
+                }}
+              >
+                <h3
+                  style={{
+                    fontFamily: "var(--font-display)",
+                    fontSize: 14,
+                    fontWeight: 800,
+                    margin: "0 0 8px",
+                    textTransform: "uppercase",
+                  }}
+                >
+                  Prep semaine (IA)
+                </h3>
+                <p style={{ fontSize: 11, color: "var(--dim)", margin: "0 0 10px", lineHeight: 1.5 }}>
+                  Génère des sessions de batch (comme le plan statique) à partir de ton profil ({latestWeight?.kg ?? "—"} kg, {userProfile.heightCm} cm,{" "}
+                  {userProfile.goal === "cut" ? "sèche" : "prise de masse"}) et du plan hebdo IA correspondant si disponible. Clé API dans l’onglet Hebdo (Gemini).
+                </p>
+                <p style={{ fontSize: 10, color: "var(--dim)", margin: "0 0 10px", lineHeight: 1.45, fontFamily: "var(--font-mono)" }}>
+                  Chaque nouvelle génération est enregistrée ; tu peux rouvrir une semaine précédente dans le menu ci-dessous.
+                </p>
+                <button
+                  type="button"
+                  disabled={!apiKey || prepGenerating}
+                  onClick={() => generatePrepWeeklyPlan()}
+                  style={{
+                    padding: "11px 16px",
+                    borderRadius: 2,
+                    border: "none",
+                    background: apiKey && !prepGenerating ? "var(--accent)" : "var(--border)",
+                    color: apiKey && !prepGenerating ? "#0A0A0E" : "var(--dim)",
+                    fontWeight: 800,
+                    fontFamily: "var(--font-display)",
+                    fontSize: 12,
+                    cursor: apiKey && !prepGenerating ? "pointer" : "not-allowed",
+                    textTransform: "uppercase",
+                    letterSpacing: "0.04em",
+                    width: "100%",
+                  }}
+                >
+                  {prepGenerating ? "Génération du prep…" : "Générer le prep de la semaine"}
+                </button>
+                {prepError ? <p style={{ color: "#FF3B5C", fontSize: 12, marginTop: 10, fontFamily: "var(--font-mono)" }}>{prepError}</p> : null}
+                {prepPlans.length > 0 ? (
+                  <div style={{ marginTop: 14 }}>
+                    {prepPlans.length > 1 ? (
+                      <label style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 12 }}>
+                        <span style={{ fontSize: 9, color: "var(--dim)", fontFamily: "var(--font-mono)", textTransform: "uppercase", letterSpacing: "0.08em" }}>
+                          Voir un prep (historique)
+                        </span>
+                        <select
+                          value={Math.min(selectedPrepIndex, prepPlans.length - 1)}
+                          onChange={(e) => setSelectedPrepIndex(Number(e.target.value))}
+                          style={{
+                            background: "var(--bg-raised)",
+                            border: "1px solid var(--border)",
+                            color: "var(--text)",
+                            padding: "10px 12px",
+                            fontFamily: "var(--font-body)",
+                            fontSize: 13,
+                            borderRadius: 2,
+                            maxWidth: "100%",
+                          }}
+                        >
+                          {prepPlans.map((p, i) => (
+                            <option key={p.weekStart + p.generatedAt} value={i}>
+                              Semaine du {formatFrDate(p.weekStart)} — {formatFrDate(p.generatedAt.slice(0, 10))}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    ) : null}
+                    {(() => {
+                      const pIdx = Math.min(selectedPrepIndex, prepPlans.length - 1);
+                      const prepPlan = prepPlans[pIdx];
+                      if (!prepPlan) return null;
+                      return (
+                        <>
+                          <div
+                            style={{
+                              display: "flex",
+                              flexWrap: "wrap",
+                              alignItems: "flex-start",
+                              justifyContent: "space-between",
+                              gap: 10,
+                              marginBottom: 8,
+                            }}
+                          >
+                            <div style={{ fontSize: 10, color: "var(--dim)", fontFamily: "var(--font-mono)", flex: "1 1 200px" }}>
+                              Semaine du {formatFrDate(prepPlan.weekStart)} · {prepPlan.calorieTarget} kcal/j · objectif {prepPlan.goalLabel}
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                if (window.confirm("Supprimer ce prep de l’historique ?")) removePrepPlanAt(pIdx);
+                              }}
+                              style={{
+                                flexShrink: 0,
+                                padding: "6px 12px",
+                                fontSize: 10,
+                                fontFamily: "var(--font-mono)",
+                                textTransform: "uppercase",
+                                letterSpacing: "0.06em",
+                                background: "rgba(255,59,92,0.08)",
+                                border: "1px solid rgba(255,59,92,0.35)",
+                                color: "#FF3B5C",
+                                cursor: "pointer",
+                                borderRadius: 2,
+                                fontWeight: 600,
+                              }}
+                            >
+                              Supprimer
+                            </button>
+                          </div>
+                          {prepPlan.notes ? (
+                            <p style={{ fontSize: 12, color: "var(--accent)", margin: "0 0 12px", fontStyle: "italic" }}>{prepPlan.notes}</p>
+                          ) : null}
+                          {prepPlan.sessions.map((sess, si) => (
+                            <div
+                              key={`prep-sess-${si}-${sess.key}`}
+                              style={{
+                                background: "rgba(190,255,0,0.04)",
+                                borderRadius: 2,
+                                padding: "12px 14px",
+                                marginBottom: 10,
+                                border: "1px solid rgba(190,255,0,0.12)",
+                              }}
+                            >
+                              <h4 style={{ fontFamily: "var(--font-display)", fontSize: 13, fontWeight: 800, margin: "0 0 10px", color: "var(--accent)" }}>
+                                {sess.label}
+                              </h4>
+                              {sess.tasks.map((task, i) => (
+                                <div key={i} style={{ display: "flex", gap: 14, alignItems: "flex-start", marginBottom: 6 }}>
+                                  <span style={{ fontFamily: "var(--font-mono)", fontSize: 9, color: "var(--accent2)", minWidth: 22 }}>{String(i + 1).padStart(2, "0")}</span>
+                                  <span style={{ fontSize: 12, lineHeight: 1.55 }}>{task}</span>
+                                </div>
+                              ))}
+                            </div>
+                          ))}
+                        </>
+                      );
+                    })()}
+                  </div>
+                ) : null}
+              </div>
+
+              <div style={{ marginBottom: 10, fontSize: 12, color: "var(--dim)", fontFamily: "var(--font-mono)" }}>Plan de référence (statique)</div>
 
               {Object.entries(COOKING_PLAN).map(([key, plan]) => (
                 <div
