@@ -218,9 +218,6 @@ export default function AuthScreen({ onLoggedIn }: { onLoggedIn: (u: AppUser) =>
           </button>
         </form>
 
-        <p style={{ margin: "18px 0 0", fontSize: 10, color: "#606080", lineHeight: 1.5, fontFamily: "'IBM Plex Mono', monospace" }}>
-          Données sauvegardées dans le cloud. Accessible depuis n'importe quel appareil.
-        </p>
       </div>
     </div>
   );
